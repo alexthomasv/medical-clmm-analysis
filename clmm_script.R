@@ -118,19 +118,15 @@ build_data_sub <- function(data, dep_var, kept_vars) {
 
 run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_dir) {
   
-  # Prepare Master Summary Files (These stay at the top level of the run)
+  # Prepare Master Summary Files
   summary_file  <- file.path(output_dir, "aic_results.csv")
   detailed_file <- file.path(output_dir, "clmm_results.csv")
   
   # --- 1. Filter by Top-Level Group ---
   if (!is.null(target_groups)) {
     available_groups <- names(metadata)
-    missing <- setdiff(target_groups, available_groups)
-    if (length(missing) > 0) warning("Groups not found: ", paste(missing, collapse = ", "))
-    
     valid_groups <- intersect(available_groups, target_groups)
     if (length(valid_groups) == 0) return(list())
-    
     metadata <- metadata[valid_groups]
   }
 
@@ -160,25 +156,19 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
 
   for (hnum in hnums_to_run) {
     
-    # --- LOGGING SETUP ---
+    # Force Garbage Collection between hypotheses to clear previous run's memory
+    gc() 
     
-    # 1. Identify Suite (Parent Folder) from hnum (e.g., v1_0 -> v1)
     suite_name <- sub("_[0-9]+$", "", hnum)
-    
-    # 2. Create Suite Directory inside Run Directory
     suite_dir <- file.path(output_dir, suite_name)
     if (!dir.exists(suite_dir)) dir.create(suite_dir, recursive = TRUE)
     
-    # 3. Create Log File Path
     log_file <- file.path(suite_dir, paste0(hnum, ".log"))
-    
-    # Open connection
     log_con <- file(log_file, open = "wt")
     sink(log_con, type = "output", split = TRUE)
     sink(log_con, type = "message") 
     
     tryCatch({
-      
       message("\n========================================")
       message(" Processing: ", hnum)
       message("========================================\n")
@@ -191,8 +181,6 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
 
       all_vars_to_cast <- unique(c(ind_vars, base_predictors))
 
-      # ---- load & cast data ----
-      # Use same suite_name logic for input data path
       data_file_path <- file.path(data_prefix, suite_name, paste0(hnum, ".csv"))
 
       if (!file.exists(data_file_path)) {
@@ -262,6 +250,9 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
 
         if (length(jobs) == 0) break
 
+        # Force GC before forking
+        gc() 
+        
         trial_results <- parallel::mclapply(jobs, function(job) {
             try_vars  <- kept_vars
             try_intrs <- kept_intrs
@@ -270,11 +261,19 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
 
             f_try <- build_formula(try_vars, try_intrs)
             fit_try <- tryCatch(ordinal::clmm(f_try, data = data_fixed, Hess = TRUE, method = "nlminb", control = control), error = function(e) NULL)
+            
             if (is.null(fit_try)) return(NULL)
-            list(job=job, aic=AIC(fit_try), fit=fit_try, vars=try_vars, intrs=try_intrs)
+            
+            # ### MEMORY FIX: Do NOT return 'fit=fit_try'. 
+            # Return only lightweight metadata.
+            list(job=job, aic=AIC(fit_try), vars=try_vars, intrs=try_intrs)
+            
           }, mc.cores = mc)
 
         trial_results <- Filter(Negate(is.null), trial_results)
+        
+        if (length(trial_results) == 0) break
+        
         aics <- vapply(trial_results, function(x) as.numeric(x$aic), numeric(1))
         valid_idx <- which(is.finite(aics))
 
@@ -284,10 +283,16 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
         if (best_try$aic < best_aic) {
           added_name <- if(best_try$job$type=="var") best_try$job$val else paste0("Intr(", best_try$job$val, ")")
           message(sprintf("Add  %-18s: AIC %.3f -> %.3f", added_name, best_aic, best_try$aic))
+          
           kept_vars  <- best_try$vars
           kept_intrs <- best_try$intrs
-          fit        <- best_try$fit
           best_aic   <- best_try$aic
+          
+          # ### MEMORY FIX: Re-fit ONLY the winner here.
+          # We didn't save the fit object, so we generate it now.
+          f_best <- build_formula(kept_vars, kept_intrs)
+          fit <- ordinal::clmm(f_best, data = data_fixed, Hess = TRUE, method = "nlminb", control = control)
+          
           improved   <- TRUE
         }
       }
@@ -297,7 +302,7 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
       print(summary(fit)) 
       message("---------------------------\n")
 
-      # ---- 2. SAVE SUMMARY ROW (Append Mode) ----
+      # ---- 2. SAVE SUMMARY ROW ----
       final_formula_str <- paste(deparse(build_formula(kept_vars, kept_intrs)), collapse = "")
       row_data <- data.frame(
         hypothesis      = hnum,
@@ -311,16 +316,9 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
         stringsAsFactors = FALSE
       )
 
-      write.table(
-        row_data, 
-        file = summary_file, 
-        append = TRUE, 
-        sep = ",", 
-        row.names = FALSE, 
-        col.names = !file.exists(summary_file)
-      )
+      write.table(row_data, file = summary_file, append = TRUE, sep = ",", row.names = FALSE, col.names = !file.exists(summary_file))
 
-      # ---- 3. CALCULATE & SAVE DETAILED STATS (Append Mode) ----
+      # ---- 3. CALCULATE & SAVE DETAILED STATS ----
       tryCatch({
         coef_summary <- summary(fit)$coefficients
         estimates <- coef_summary[, "Estimate"]
@@ -340,14 +338,7 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
           stringsAsFactors = FALSE
         )
         
-        write.table(
-          detailed_df, 
-          file = detailed_file, 
-          append = TRUE, 
-          sep = ",", 
-          row.names = FALSE, 
-          col.names = !file.exists(detailed_file)
-        )
+        write.table(detailed_df, file = detailed_file, append = TRUE, sep = ",", row.names = FALSE, col.names = !file.exists(detailed_file))
         message("Saved summary CSVs.")
       }, error = function(e) {
         warning("Failed to save detailed stats for ", hnum, ": ", conditionMessage(e))
@@ -383,6 +374,6 @@ if (!dir.exists(run_dir)) {
 res <- run_forward_aic(
     metadata, 
     data_prefix, 
-    target_groups = c("v1", "v1_dummy", "v2", "v3", "v4", "v6"),
+    target_groups = c("v2", "v3", "v4", "v6"),
     output_dir = run_dir
 )
