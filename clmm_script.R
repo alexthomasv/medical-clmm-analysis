@@ -116,22 +116,20 @@ build_data_sub <- function(data, dep_var, kept_vars) {
 
 # ---- PARALLEL FORWARD AIC ----
 
-# UPDATED: Handles subdirectories for data files
-run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_file = "aic_results_incremental.csv") {
+run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_dir) {
+  
+  # Prepare Master Summary Files (These stay at the top level of the run)
+  summary_file  <- file.path(output_dir, "aic_results.csv")
+  detailed_file <- file.path(output_dir, "clmm_results.csv")
   
   # --- 1. Filter by Top-Level Group ---
   if (!is.null(target_groups)) {
     available_groups <- names(metadata)
     missing <- setdiff(target_groups, available_groups)
-    if (length(missing) > 0) {
-      warning("The following groups were not found in metadata: ", paste(missing, collapse = ", "))
-    }
+    if (length(missing) > 0) warning("Groups not found: ", paste(missing, collapse = ", "))
     
     valid_groups <- intersect(available_groups, target_groups)
-    if (length(valid_groups) == 0) {
-      message("No valid groups selected. Exiting.")
-      return(list())
-    }
+    if (length(valid_groups) == 0) return(list())
     
     metadata <- metadata[valid_groups]
   }
@@ -151,221 +149,219 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
   metadata <- flat_metadata 
   hnums_to_run <- names(metadata)
   
-  message(sprintf("[Forward AIC] Selected Groups: %s", if(is.null(target_groups)) "ALL" else paste(target_groups, collapse=", ")))
-  message(sprintf("[Forward AIC] Queued %d hypotheses: %s", length(hnums_to_run), paste(hnums_to_run, collapse=", ")))
-  message(sprintf("[Forward AIC] Appending results to: %s", output_file))
+  message(sprintf("Queued %d hypotheses.\nRun Directory: %s", length(hnums_to_run), output_dir))
 
   # --- Parallel Setup ---
   results <- list()
   mc_opt      <- getOption("mc.cores")
   mc_detected <- parallel::detectCores(logical = TRUE)
   mc <- max(1L, if (is.null(mc_opt)) mc_detected - 1L else as.integer(mc_opt))
-  message(sprintf("[Forward AIC] Using %d parallel worker(s).", mc))
+  message(sprintf("Using %d parallel worker(s).", mc))
 
   for (hnum in hnums_to_run) {
-    message("\n=== Forward AIC for: ", hnum, " ===")
-
-    ind_vars <- metadata[[hnum]][["ind_vars"]]
-    dep_var  <- metadata[[hnum]][["dep_var"]]
-    inters   <- metadata[[hnum]][["interactions"]]
-
-    # 1. SETUP: Base Predictors
-    base_predictors <- metadata[[hnum]][["base_predictors"]]
-    if (is.null(base_predictors)) base_predictors <- character(0)
-
-    all_vars_to_cast <- unique(c(ind_vars, base_predictors))
-
-    # ---- load & cast data ----
     
-    # NEW LOGIC: Calculate subdirectory based on hnum
-    # This assumes hnum is like "v1_0" (parent "v1") or "v1_dummy_0" (parent "v1_dummy")
-    # We strip the last underscore and the digits following it to get the parent folder.
-    parent_folder <- sub("_[0-9]+$", "", hnum)
+    # --- LOGGING SETUP ---
     
-    # Construct path: hypothesis_data/v1/v1_0.csv
-    data_file_path <- file.path(data_prefix, parent_folder, paste0(hnum, ".csv"))
+    # 1. Identify Suite (Parent Folder) from hnum (e.g., v1_0 -> v1)
+    suite_name <- sub("_[0-9]+$", "", hnum)
+    
+    # 2. Create Suite Directory inside Run Directory
+    suite_dir <- file.path(output_dir, suite_name)
+    if (!dir.exists(suite_dir)) dir.create(suite_dir, recursive = TRUE)
+    
+    # 3. Create Log File Path
+    log_file <- file.path(suite_dir, paste0(hnum, ".log"))
+    
+    # Open connection
+    log_con <- file(log_file, open = "wt")
+    sink(log_con, type = "output", split = TRUE)
+    sink(log_con, type = "message") 
+    
+    tryCatch({
+      
+      message("\n========================================")
+      message(" Processing: ", hnum)
+      message("========================================\n")
 
-    if (!file.exists(data_file_path)) {
-      message("Skipping ", hnum, " (file not found at: ", data_file_path, ")")
-      next
-    }
-    data <- read.csv(data_file_path, check.names = FALSE)
+      ind_vars <- metadata[[hnum]][["ind_vars"]]
+      dep_var  <- metadata[[hnum]][["dep_var"]]
+      inters   <- metadata[[hnum]][["interactions"]]
+      base_predictors <- metadata[[hnum]][["base_predictors"]]
+      if (is.null(base_predictors)) base_predictors <- character(0)
 
-    for (v in all_vars_to_cast) {
-      if (v %in% names(data)) {
-        data[[v]] <- cast_by_name(data[[v]], v)
-      } else {
-        warning(sprintf("Variable '%s' listed in metadata but missing from CSV.", v))
+      all_vars_to_cast <- unique(c(ind_vars, base_predictors))
+
+      # ---- load & cast data ----
+      # Use same suite_name logic for input data path
+      data_file_path <- file.path(data_prefix, suite_name, paste0(hnum, ".csv"))
+
+      if (!file.exists(data_file_path)) {
+        message("Skipping ", hnum, " (file not found)")
+        sink(type = "message"); sink(type = "output"); close(log_con)
+        next
       }
-    }
-    data[[dep_var]] <- factor(data[[dep_var]], ordered = TRUE)
+      
+      data <- read.csv(data_file_path, check.names = FALSE)
 
-    do_linear_only <- !grepl("_do_full$", hnum)
+      for (v in all_vars_to_cast) {
+        if (v %in% names(data)) data[[v]] <- cast_by_name(data[[v]], v)
+      }
+      data[[dep_var]] <- factor(data[[dep_var]], ordered = TRUE)
 
-    # Process interactions
-    interaction_defs <- build_pairwise_interactions(inters, data, linear_only = do_linear_only)
+      do_linear_only <- !grepl("_do_full$", hnum)
+      interaction_defs <- build_pairwise_interactions(inters, data, linear_only = do_linear_only)
 
-    # ---- formula builder ----
-    build_formula <- function(kept_vars, kept_intrs_strs) {
-      main_terms <- vapply(
-        kept_vars,
-        function(v) format_var(v, data, linear_only = do_linear_only),
-        character(1)
+      build_formula <- function(kept_vars, kept_intrs_strs) {
+        main_terms <- vapply(kept_vars, function(v) format_var(v, data, linear_only = do_linear_only), character(1))
+        rhs_terms <- c(main_terms, kept_intrs_strs)
+        rhs_str   <- paste(rhs_terms, collapse = " + ")
+        stats::as.formula(paste(dep_var, "~", if (nzchar(rhs_str)) rhs_str else "1", "+ (1 | topic_condition) + (1 | participant_number) + (1 | data_practice)"))
+      }
+
+      # ---- STEP 0: BASE MODEL ----
+      kept_vars  <- base_predictors
+      kept_intrs <- character(0)
+      data_fixed <- build_data_sub(data, dep_var, all_vars_to_cast)
+      control <- ordinal::clmm.control(gradTol = 1e-6)
+
+      f_curr <- build_formula(kept_vars, kept_intrs)
+      print(f_curr) 
+
+      fit <- tryCatch(
+        ordinal::clmm(f_curr, data = data_fixed, Hess = TRUE, method = "nlminb", control = control),
+        error = function(e) {
+          message("Base model failed: ", conditionMessage(e))
+          return(NULL)
+        }
       )
 
-      rhs_terms <- c(main_terms, kept_intrs_strs)
-      rhs_str   <- paste(rhs_terms, collapse = " + ")
-
-      stats::as.formula(paste(
-        dep_var, "~", if (nzchar(rhs_str)) rhs_str else "1",
-        "+ (1 | topic_condition) + (1 | participant_number) + (1 | data_practice)"
-      ))
-    }
-
-    # ---- STEP 0: START DIRECTLY WITH BASE MODEL ----
-    kept_vars  <- base_predictors
-    kept_intrs <- character(0)
-    data_fixed <- build_data_sub(data, dep_var, all_vars_to_cast)
-    control <- ordinal::clmm.control(gradTol = 1e-6)
-
-    f_curr <- build_formula(kept_vars, kept_intrs)
-    print(f_curr)
-
-    fit <- tryCatch(
-      ordinal::clmm(f_curr, data = data_fixed, Hess = TRUE, method = "nlminb", control = control),
-      error = function(e) {
-        warning("Base model failed for ", hnum, ": ", conditionMessage(e))
-        return(NULL)
+      if (is.null(fit)) {
+         sink(type = "message"); sink(type = "output"); close(log_con)
+         next
       }
-    )
 
-    if (is.null(fit)) next
+      best_aic <- AIC(fit)
+      message(sprintf("Start (Base) AIC: %.3f", best_aic))
 
-    best_aic <- AIC(fit)
-    message(sprintf("Start (Base) AIC: %.3f | Predictors: %s", best_aic, paste(kept_vars, collapse=", ")))
-
-    # ---- FORWARD LOOP ----
-    improved <- TRUE
-    while (improved) {
-      improved <- FALSE
-
-      cand_vars <- setdiff(all_vars_to_cast, kept_vars)
-      cand_intrs <- list()
-      if (length(interaction_defs) > 0) {
-        for (item in interaction_defs) {
-          if (item$term_str %in% kept_intrs) next
-          if (all(item$parents %in% kept_vars)) {
-            cand_intrs <- c(cand_intrs, list(item))
+      # ---- FORWARD LOOP ----
+      improved <- TRUE
+      while (improved) {
+        improved <- FALSE
+        cand_vars <- setdiff(all_vars_to_cast, kept_vars)
+        cand_intrs <- list()
+        if (length(interaction_defs) > 0) {
+          for (item in interaction_defs) {
+            if (item$term_str %in% kept_intrs) next
+            if (all(item$parents %in% kept_vars)) cand_intrs <- c(cand_intrs, list(item))
           }
+        }
+
+        jobs <- list()
+        for (v in cand_vars) jobs[[length(jobs)+1]] <- list(type="var", val=v)
+        for (i in cand_intrs) jobs[[length(jobs)+1]] <- list(type="intr", val=i$term_str)
+
+        if (length(jobs) == 0) break
+
+        trial_results <- parallel::mclapply(jobs, function(job) {
+            try_vars  <- kept_vars
+            try_intrs <- kept_intrs
+            if (job$type == "var") try_vars <- c(try_vars, job$val)
+            else try_intrs <- c(try_intrs, job$val)
+
+            f_try <- build_formula(try_vars, try_intrs)
+            fit_try <- tryCatch(ordinal::clmm(f_try, data = data_fixed, Hess = TRUE, method = "nlminb", control = control), error = function(e) NULL)
+            if (is.null(fit_try)) return(NULL)
+            list(job=job, aic=AIC(fit_try), fit=fit_try, vars=try_vars, intrs=try_intrs)
+          }, mc.cores = mc)
+
+        trial_results <- Filter(Negate(is.null), trial_results)
+        aics <- vapply(trial_results, function(x) as.numeric(x$aic), numeric(1))
+        valid_idx <- which(is.finite(aics))
+
+        if (length(valid_idx) == 0) break
+        best_try <- trial_results[[valid_idx[which.min(aics[valid_idx])]]]
+
+        if (best_try$aic < best_aic) {
+          added_name <- if(best_try$job$type=="var") best_try$job$val else paste0("Intr(", best_try$job$val, ")")
+          message(sprintf("Add  %-18s: AIC %.3f -> %.3f", added_name, best_aic, best_try$aic))
+          kept_vars  <- best_try$vars
+          kept_intrs <- best_try$intrs
+          fit        <- best_try$fit
+          best_aic   <- best_try$aic
+          improved   <- TRUE
         }
       }
 
-      jobs <- list()
-      for (v in cand_vars) jobs[[length(jobs)+1]] <- list(type="var", val=v)
-      for (i in cand_intrs) jobs[[length(jobs)+1]] <- list(type="intr", val=i$term_str)
+      # ---- 1. DUMP FINAL MODEL SUMMARY TO LOG ----
+      message("\n--- FINAL MODEL SUMMARY ---")
+      print(summary(fit)) 
+      message("---------------------------\n")
 
-      if (length(jobs) == 0) break
-
-      trial_results <- parallel::mclapply(
-        jobs,
-        function(job) {
-          try_kept_vars  <- kept_vars
-          try_kept_intrs <- kept_intrs
-          if (job$type == "var") try_kept_vars <- c(try_kept_vars, job$val)
-          else try_kept_intrs <- c(try_kept_intrs, job$val)
-
-          f_try <- build_formula(try_kept_vars, try_kept_intrs)
-          fit_try <- tryCatch(
-            ordinal::clmm(f_try, data = data_fixed, Hess = TRUE, method = "nlminb", control = control),
-            error = function(e) NULL
-          )
-          if (is.null(fit_try)) return(NULL)
-          list(job=job, aic=AIC(fit_try), fit=fit_try, kept_vars=try_kept_vars, kept_intrs=try_kept_intrs)
-        },
-        mc.cores = mc
+      # ---- 2. SAVE SUMMARY ROW (Append Mode) ----
+      final_formula_str <- paste(deparse(build_formula(kept_vars, kept_intrs)), collapse = "")
+      row_data <- data.frame(
+        hypothesis      = hnum,
+        AIC             = as.numeric(best_aic),
+        nobs            = as.integer(tryCatch(fit$info$nobs, error = function(e) NA)),
+        max_grad        = as.numeric(tryCatch(fit$info$max.grad, error = function(e) NA)),
+        k_predictors    = length(kept_vars),
+        kept_predictors = paste(kept_vars, collapse = " + "),
+        interactions    = if (length(kept_intrs)) paste(kept_intrs, collapse = " + ") else "",
+        formula         = final_formula_str,
+        stringsAsFactors = FALSE
       )
 
-      trial_results <- Filter(Negate(is.null), trial_results)
-      aics <- vapply(trial_results, function(x) as.numeric(x$aic), numeric(1))
-      valid_idx <- which(is.finite(aics))
+      write.table(
+        row_data, 
+        file = summary_file, 
+        append = TRUE, 
+        sep = ",", 
+        row.names = FALSE, 
+        col.names = !file.exists(summary_file)
+      )
 
-      if (length(valid_idx) == 0) break
+      # ---- 3. CALCULATE & SAVE DETAILED STATS (Append Mode) ----
+      tryCatch({
+        coef_summary <- summary(fit)$coefficients
+        estimates <- coef_summary[, "Estimate"]
+        std_errors <- coef_summary[, "Std. Error"]
+        
+        detailed_df <- data.frame(
+          Hypothesis  = hnum,
+          Term        = rownames(coef_summary),
+          Type        = ifelse(grepl("\\|", rownames(coef_summary)), "Threshold", "Predictor"),
+          Estimate    = estimates,
+          Std_Error   = std_errors,
+          Z_Value     = coef_summary[, "z value"],
+          P_Value     = coef_summary[, "Pr(>|z|)"],
+          Odds_Ratio  = exp(estimates),
+          CI_Lower_95 = exp(estimates - 1.96 * std_errors),
+          CI_Upper_95 = exp(estimates + 1.96 * std_errors),
+          stringsAsFactors = FALSE
+        )
+        
+        write.table(
+          detailed_df, 
+          file = detailed_file, 
+          append = TRUE, 
+          sep = ",", 
+          row.names = FALSE, 
+          col.names = !file.exists(detailed_file)
+        )
+        message("Saved summary CSVs.")
+      }, error = function(e) {
+        warning("Failed to save detailed stats for ", hnum, ": ", conditionMessage(e))
+      })
 
-      best_local_idx <- valid_idx[which.min(aics[valid_idx])]
-      best_try       <- trial_results[[best_local_idx]]
-
-      if (best_try$aic < best_aic) {
-        added_name <- if(best_try$job$type=="var") best_try$job$val else paste0("Intr(", best_try$job$val, ")")
-        message(sprintf("Add  %-18s: AIC %.3f -> %.3f", added_name, best_aic, best_try$aic))
-        kept_vars  <- best_try$kept_vars
-        kept_intrs <- best_try$kept_intrs
-        fit        <- best_try$fit
-        best_aic   <- best_try$aic
-        improved   <- TRUE
-      }
-    }
-
-    # ---- Final Output Calculation ----
-    final_formula_str <- paste(deparse(build_formula(kept_vars, kept_intrs)), collapse = "")
-    nobs    <- tryCatch(fit$info$nobs,     error = function(e) NA)
-    maxgrad <- tryCatch(fit$info$max.grad, error = function(e) NA)
-
-    # --- SAVE INCREMENTALLY TO FILE ---
-    row_data <- data.frame(
-      hypothesis      = hnum,
-      AIC             = as.numeric(best_aic),
-      nobs            = as.integer(nobs),
-      max_grad        = as.numeric(maxgrad),
-      k_predictors    = length(kept_vars),
-      kept_predictors = paste(kept_vars, collapse = " + "),
-      interactions    = if (length(kept_intrs)) paste(kept_intrs, collapse = " + ") else "",
-      formula         = final_formula_str,
-      stringsAsFactors = FALSE,
-      check.names = FALSE
-    )
-
-    write.table(
-      row_data, 
-      file = output_file, 
-      append = file.exists(output_file), 
-      sep = ",", 
-      row.names = FALSE, 
-      col.names = !file.exists(output_file)
-    )
-    
-    results[[hnum]] <- list(
-      hnum            = hnum,
-      final_fit       = fit,
-      kept_predictors = kept_vars,
-      kept_interactions = kept_intrs,
-      AIC             = as.numeric(best_aic),
-      nobs            = as.integer(nobs),
-      max_grad        = as.numeric(maxgrad),
-      formula         = final_formula_str
-    )
+      results[[hnum]] <- list(hnum=hnum, aic=best_aic)
+      
+    }, finally = {
+      sink(type = "message")
+      sink(type = "output")
+      close(log_con)
+    })
   }
-
   invisible(results)
-}
-
-summarize_results <- function(results_list) {
-  rows <- lapply(results_list, function(x) {
-    data.frame(
-      hypothesis      = x$hnum,
-      AIC             = x$AIC,
-      nobs            = x$nobs,
-      max_grad        = x$max_grad,
-      k_predictors    = length(x$kept_predictors),
-      kept_predictors = paste(x$kept_predictors, collapse = " + "),
-      interactions    = if (length(x$kept_interactions)) paste(x$kept_interactions, collapse = " + ") else "",
-      formula         = x$formula,
-      stringsAsFactors = FALSE,
-      check.names = FALSE
-    )
-  })
-  out <- do.call(rbind, rows)
-  if (is.null(out)) return(data.frame())
-  out[order(out$AIC), , drop = FALSE]
 }
 
 # ---- Driver ----
@@ -374,17 +370,19 @@ file_path   <- paste0(file_prefix, "metadata.json")
 metadata    <- fromJSON(file_path)
 
 data_prefix <- "hypothesis_data/"
-output_csv <- "aic_results.csv"
 
-# Optional: Clear old results
-if (file.exists(output_csv)) file.remove(output_csv)
+# 1. Create Timestamped Run Directory
+timestamp <- format(Sys.time(), "%Y-%m-%d_%H-%M-%S")
+run_dir <- file.path("results", paste0("run_", timestamp))
 
+if (!dir.exists(run_dir)) {
+  dir.create(run_dir, recursive = TRUE)
+}
+
+# 2. Run
 res <- run_forward_aic(
     metadata, 
     data_prefix, 
     target_groups = c("v1", "v1_dummy", "v2", "v3", "v4", "v6"),
-    output_file = output_csv
+    output_dir = run_dir
 )
-
-summary_df <- summarize_results(res)
-print(summary_df)
