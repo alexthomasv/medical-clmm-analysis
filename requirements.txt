@@ -1,0 +1,4 @@
+scipy
+gspread
+google-auth
+pandas
