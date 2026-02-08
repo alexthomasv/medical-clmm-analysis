@@ -9,15 +9,18 @@ library(parallel)
 
 format_var <- function(var, data, linear_only = TRUE) {
   if (is.ordered(data[[var]]) && isTRUE(linear_only)) {
-    sprintf("C(`%s`, contr.poly, 1)", var)   # Linear component only
+    sprintf("scale(as.numeric(`%s`))", var) 
   } else {
-    sprintf("`%s`", var)                      # Full coding
+    sprintf("`%s`", var) 
   }
+}
+
+format_as_factor <- function(var, data) {
+  sprintf("as.factor(`%s`)", var)
 }
 
 build_pairwise_interactions <- function(interactions, data, linear_only = TRUE) {
   if (is.null(interactions)) return(character(0))
-
   if (is.list(interactions)) {
     if (length(interactions) == 0L) return(character(0))
     lst <- lapply(interactions, function(x) as.character(unlist(x, use.names = FALSE)))
@@ -29,23 +32,15 @@ build_pairwise_interactions <- function(interactions, data, linear_only = TRUE) 
     }
     interactions <- mat
   }
-
-  if (is.data.frame(interactions)) {
-    interactions <- as.matrix(interactions)
-  }
-
-  if (!is.matrix(interactions) || any(dim(interactions) == 0L)) {
-    return(character(0))
-  }
+  if (is.data.frame(interactions)) interactions <- as.matrix(interactions)
+  if (!is.matrix(interactions) || any(dim(interactions) == 0L)) return(character(0))
 
   vars <- unique(as.vector(interactions))
   vars <- vars[!is.na(vars)]
   vars <- trimws(as.character(vars))
   vars <- vars[nzchar(vars)]
   missing <- setdiff(vars, names(data))
-  if (length(missing)) {
-    stop("Missing variables in `data`: ", paste(missing, collapse = ", "))
-  }
+  if (length(missing)) stop("Missing variables in `data`: ", paste(missing, collapse = ", "))
 
   for (v in vars) {
     if (!is.factor(data[[v]])) data[[v]] <- factor(data[[v]], ordered = TRUE)
@@ -56,29 +51,20 @@ build_pairwise_interactions <- function(interactions, data, linear_only = TRUE) 
     r <- r[!is.na(r) & nzchar(r)]
     if (!length(r)) return(NULL)
     if (any(duplicated(r))) return(NULL)
-
     term_pieces <- sapply(r, function(v) {
       if (is.ordered(data[[v]]) && isTRUE(linear_only)) {
-        sprintf("C(`%s`, contr.poly, 1)", v)
+        sprintf("scale(as.numeric(`%s`))", v)
       } else {
         sprintf("`%s`", v)
       }
     })
-
-    list(
-      term_str = paste(term_pieces, collapse = ":"),
-      parents  = r
-    )
+    list(term_str = paste(term_pieces, collapse = ":"), parents  = r)
   })
-
   out_list[!sapply(out_list, is.null)]
 }
 
-# ---- Casting helpers (Unchanged) ----
-
 cast_by_name <- function(x, name) {
-  lev_usefreq     <- c("Less than once a year","A few times a year",
-                       "A few times a month","A few times a week","Daily")
+  lev_usefreq     <- c("Less than once a year","A few times a year", "A few times a month","A few times a week","Daily")
   lev_gender      <- c("Woman","Man","Non-binary", "NO_DATA")
   lev_ethnicity   <- c("White","Asian","Black","Latino/Hispanic","Mixed","Other", "NO_DATA")
   lev_age         <- c("18-20","21-44","45-64","65+", "NO_DATA")
@@ -103,26 +89,80 @@ cast_by_name <- function(x, name) {
 build_data_sub <- function(data, dep_var, kept_vars) {
   vars_used <- unique(c(dep_var, kept_vars, "topic_condition", "participant_number", "data_practice"))
   df <- data[, vars_used, drop = FALSE]
-
   bad_never  <- "I've never used one"
   bad_nodata <- "NO_DATA"
-
   if ("gender"         %in% names(df)) df <- df[df$gender         != bad_nodata  & !is.na(df$gender), , drop = FALSE]
   if ("experience_hf"  %in% names(df)) df <- df[df$experience_hf  != bad_never   & !is.na(df$experience_hf), , drop = FALSE]
   if ("experience_med" %in% names(df)) df <- df[df$experience_med != bad_never   & !is.na(df$experience_med), , drop = FALSE]
-
   df[stats::complete.cases(df[, vars_used, drop = FALSE]), , drop = FALSE]
+}
+
+# ---- NEW FUNCTION: UNIVARIATE LINEARITY CHECK (ROBUST) ----
+
+perform_linearity_check <- function(final_fit, data, kept_vars, kept_intrs, dep_var, control) {
+  message("\n--- POST-HOC LINEARITY CHECK (UNIVARIATE) ---")
+  
+  if (length(kept_vars) == 0) {
+    message("No predictors to check.")
+    return()
+  }
+
+  for (v in kept_vars) {
+    if (is.ordered(data[[v]])) {
+      
+      # 1. Build a Simple "Marginal" Check Formula
+      # We check the shape of 'v' ALONE.
+      # This prevents multicollinearity with other controls from distorting the shape check.
+      
+      # Formula: y ~ as.factor(v) + random_effects
+      f_check <- stats::as.formula(paste(dep_var, "~", format_as_factor(v, data), "+ (1 | topic_condition) + (1 | participant_number) + (1 | data_practice)"))
+      
+      # 2. Fit the Check Model
+      fit_check <- tryCatch(
+        ordinal::clmm(f_check, data = data, Hess = FALSE, method = "nlminb", control = control),
+        error = function(e) return(NULL)
+      )
+      
+      if (!is.null(fit_check)) {
+        coefs <- coef(fit_check)
+        pattern <- paste0("as.factor\\(`?", v, "`?\\)")
+        idx <- grep(pattern, names(coefs))
+        
+        if (length(idx) > 1) {
+          vals <- coefs[idx]
+          y_vals <- c(0, vals) # Reference level is 0
+          x_vals <- 1:length(y_vals)
+          
+          # 3. Check "Staircase" shape
+          r <- cor(x_vals, y_vals)
+          
+          # 4. Report
+          if (r > 0.9) {
+             message(sprintf("Checking %-15s: [PASS] (r=%.3f) - Staircase shape confirmed.", v, r))
+          } else if (r > 0.7) {
+             message(sprintf("Checking %-15s: [WARN] (r=%.3f) - Monotonic but roughly linear.", v, r))
+          } else {
+             message(sprintf("Checking %-15s: [FAIL] (r=%.3f) - Non-linear shape.", v, r))
+             message(sprintf("      -> Factor Coefs: %s", paste(round(y_vals, 2), collapse=", ")))
+          }
+        } else {
+          message(sprintf("Checking %-15s: [SKIP] Not enough levels.", v))
+        }
+      } else {
+        message(sprintf("Checking %-15s: [SKIP] Model failed to converge.", v))
+      }
+    }
+  }
+  message("---------------------------------------------\n")
 }
 
 # ---- PARALLEL FORWARD AIC ----
 
 run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_dir) {
   
-  # Prepare Master Summary Files
   summary_file  <- file.path(output_dir, "aic_results.csv")
   detailed_file <- file.path(output_dir, "clmm_results.csv")
   
-  # --- 1. Filter by Top-Level Group ---
   if (!is.null(target_groups)) {
     available_groups <- names(metadata)
     valid_groups <- intersect(available_groups, target_groups)
@@ -130,7 +170,6 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
     metadata <- metadata[valid_groups]
   }
 
-  # --- 2. Flatten Metadata Structure ---
   flat_metadata <- list()
   for (group in names(metadata)) {
     if (is.list(metadata[[group]]) && !("ind_vars" %in% names(metadata[[group]]))) {
@@ -147,7 +186,6 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
   
   message(sprintf("Queued %d hypotheses.\nRun Directory: %s", length(hnums_to_run), output_dir))
 
-  # --- Parallel Setup ---
   results <- list()
   mc_opt      <- getOption("mc.cores")
   mc_detected <- parallel::detectCores(logical = TRUE)
@@ -155,10 +193,7 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
   message(sprintf("Using %d parallel worker(s).", mc))
 
   for (hnum in hnums_to_run) {
-    
-    # Force Garbage Collection between hypotheses to clear previous run's memory
     gc() 
-    
     suite_name <- sub("_[0-9]+$", "", hnum)
     suite_dir <- file.path(output_dir, suite_name)
     if (!dir.exists(suite_dir)) dir.create(suite_dir, recursive = TRUE)
@@ -180,7 +215,6 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
       if (is.null(base_predictors)) base_predictors <- character(0)
 
       all_vars_to_cast <- unique(c(ind_vars, base_predictors))
-
       data_file_path <- file.path(data_prefix, suite_name, paste0(hnum, ".csv"))
 
       if (!file.exists(data_file_path)) {
@@ -190,7 +224,6 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
       }
       
       data <- read.csv(data_file_path, check.names = FALSE)
-
       for (v in all_vars_to_cast) {
         if (v %in% names(data)) data[[v]] <- cast_by_name(data[[v]], v)
       }
@@ -249,8 +282,6 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
         for (i in cand_intrs) jobs[[length(jobs)+1]] <- list(type="intr", val=i$term_str)
 
         if (length(jobs) == 0) break
-
-        # Force GC before forking
         gc() 
         
         trial_results <- parallel::mclapply(jobs, function(job) {
@@ -263,36 +294,27 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
             fit_try <- tryCatch(ordinal::clmm(f_try, data = data_fixed, Hess = TRUE, method = "nlminb", control = control), error = function(e) NULL)
             
             if (is.null(fit_try)) return(NULL)
-            
-            # ### MEMORY FIX: Do NOT return 'fit=fit_try'. 
-            # Return only lightweight metadata.
             list(job=job, aic=AIC(fit_try), vars=try_vars, intrs=try_intrs)
-            
           }, mc.cores = mc)
 
         trial_results <- Filter(Negate(is.null), trial_results)
-        
         if (length(trial_results) == 0) break
         
         aics <- vapply(trial_results, function(x) as.numeric(x$aic), numeric(1))
         valid_idx <- which(is.finite(aics))
-
         if (length(valid_idx) == 0) break
+        
         best_try <- trial_results[[valid_idx[which.min(aics[valid_idx])]]]
 
         if (best_try$aic < best_aic) {
           added_name <- if(best_try$job$type=="var") best_try$job$val else paste0("Intr(", best_try$job$val, ")")
           message(sprintf("Add  %-18s: AIC %.3f -> %.3f", added_name, best_aic, best_try$aic))
-          
           kept_vars  <- best_try$vars
           kept_intrs <- best_try$intrs
           best_aic   <- best_try$aic
           
-          # ### MEMORY FIX: Re-fit ONLY the winner here.
-          # We didn't save the fit object, so we generate it now.
           f_best <- build_formula(kept_vars, kept_intrs)
           fit <- ordinal::clmm(f_best, data = data_fixed, Hess = TRUE, method = "nlminb", control = control)
-          
           improved   <- TRUE
         }
       }
@@ -302,7 +324,10 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
       print(summary(fit)) 
       message("---------------------------\n")
 
-      # ---- 2. SAVE SUMMARY ROW ----
+      # ---- 2. PERFORM LINEARITY CHECK ----
+      perform_linearity_check(fit, data_fixed, kept_vars, kept_intrs, dep_var, control)
+      
+      # ---- 3. SAVE SUMMARY ROW ----
       final_formula_str <- paste(deparse(build_formula(kept_vars, kept_intrs)), collapse = "")
       row_data <- data.frame(
         hypothesis      = hnum,
@@ -315,10 +340,9 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
         formula         = final_formula_str,
         stringsAsFactors = FALSE
       )
-
       write.table(row_data, file = summary_file, append = TRUE, sep = ",", row.names = FALSE, col.names = !file.exists(summary_file))
 
-      # ---- 3. CALCULATE & SAVE DETAILED STATS ----
+      # ---- 4. CALCULATE & SAVE DETAILED STATS ----
       tryCatch({
         coef_summary <- summary(fit)$coefficients
         estimates <- coef_summary[, "Estimate"]
@@ -337,7 +361,6 @@ run_forward_aic <- function(metadata, data_prefix, target_groups = NULL, output_
           CI_Upper_95 = exp(estimates + 1.96 * std_errors),
           stringsAsFactors = FALSE
         )
-        
         write.table(detailed_df, file = detailed_file, append = TRUE, sep = ",", row.names = FALSE, col.names = !file.exists(detailed_file))
         message("Saved summary CSVs.")
       }, error = function(e) {
@@ -361,19 +384,13 @@ file_path   <- paste0(file_prefix, "metadata.json")
 metadata    <- fromJSON(file_path)
 
 data_prefix <- "hypothesis_data/"
-
-# 1. Create Timestamped Run Directory
 timestamp <- format(Sys.time(), "%Y-%m-%d_%H-%M-%S")
 run_dir <- file.path("results", paste0("run_", timestamp))
+if (!dir.exists(run_dir)) dir.create(run_dir, recursive = TRUE)
 
-if (!dir.exists(run_dir)) {
-  dir.create(run_dir, recursive = TRUE)
-}
-
-# 2. Run
 res <- run_forward_aic(
     metadata, 
     data_prefix, 
-    target_groups = c("v2", "v3", "v4", "v6"),
+    target_groups = c("v3", "v4", "v6"),
     output_dir = run_dir
 )
