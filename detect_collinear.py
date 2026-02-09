@@ -1,96 +1,102 @@
 import pandas as pd
 import numpy as np
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from numpy.linalg import cond, svd
 
-def check_rank_deficiency(file_path):
-    # 1. Load the data
+def thorough_check(file_path):
+    print(f"--- FULL DIAGNOSTIC: {file_path} ---")
     try:
         df = pd.read_csv(file_path)
-        print(f"Successfully loaded {len(df)} rows from {file_path}.\n")
-    except FileNotFoundError:
-        print(f"Error: Could not find file '{file_path}'. Make sure it exists.")
+    except Exception as e:
+        print(f"Error loading file: {e}")
         return
 
-    # List of your fixed effect variables (predictors)
-    # These are the ones involved in the "design is column rank deficient" error
+    # 1. Select the exact predictors involved in the model
+    # Update this list if your variable names differ
     predictors = ['dtype_health', 'purpose_sens', 'dtype_relevant', 
                   'purpose_health', 'dtype_sens']
     
-    # Also check against your grouping variable
-    group_col = 'topic_condition'
+    # Check if columns exist
+    missing = [c for c in predictors if c not in df.columns]
+    if missing:
+        print(f"Error: Columns not found: {missing}")
+        return
 
-    print("--- DIAGNOSTIC REPORT ---\n")
-
-    # CHECK 1: Constant Columns (Zero Variance)
-    # If a column has only 1 unique value, it cannot predict anything.
-    print("1. CHECKING FOR CONSTANT COLUMNS:")
-    constant_found = False
-    for col in predictors:
-        if col in df.columns:
-            if df[col].nunique() <= 1:
-                print(f"   [!] CRITICAL: '{col}' has only 1 unique value: {df[col].unique()}")
-                constant_found = True
+    # Drop NAs (Linear models drop rows with ANY missing data)
+    df_clean = df[predictors].dropna()
+    X = df_clean.astype(float) # Treat as numeric for the test
     
-    if not constant_found:
-        print("   -> No constant columns found (Good).")
+    print(f"Data Shape: {X.shape[0]} rows x {X.shape[1]} columns\n")
 
-    print("\n" + "-"*30 + "\n")
+    # --- CHECK 1: CORRELATION MATRIX ---
+    print("1. PAIRWISE CORRELATIONS (Threshold > 0.85)")
+    corr = X.corr().abs()
+    # Mask diagonal
+    np.fill_diagonal(corr.values, 0)
+    
+    high_corr = corr.unstack().sort_values(ascending=False)
+    high_corr = high_corr[high_corr > 0.85]
+    
+    # Remove duplicates (A-B is same as B-A)
+    seen = set()
+    found_corr = False
+    for idx, val in high_corr.items():
+        pair = tuple(sorted(idx))
+        if pair not in seen:
+            seen.add(pair)
+            print(f"   [!] WARNING: {pair[0]} <-> {pair[1]} : r = {val:.4f}")
+            found_corr = True
+    
+    if not found_corr:
+        print("   -> No dangerously high pairwise correlations found.")
 
-    # CHECK 2: Perfect Correlation (Multicollinearity)
-    # If two columns have correlation > 0.99 (or <-0.99), they are redundant.
-    print("2. CHECKING FOR PERFECT CORRELATIONS:")
+    # --- CHECK 2: VARIANCE INFLATION FACTOR (VIF) ---
+    print("\n2. VARIANCE INFLATION FACTOR (VIF)")
+    print("   (VIF > 5 is high; VIF > 10 is critical)")
     
-    # Filter only numeric predictors present in the dataframe
-    numeric_preds = [c for c in predictors if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+    # We add a constant (intercept) because VIF requires it
+    X_const = sm.add_constant(X)
+    vif_data = pd.DataFrame()
+    vif_data["Variable"] = X_const.columns
+    vif_data["VIF"] = [variance_inflation_factor(X_const.values, i) 
+                       for i in range(X_const.shape[1])]
     
-    if len(numeric_preds) > 1:
-        corr_matrix = df[numeric_preds].corr().abs()
+    # Filter out the 'const' row for cleaner output
+    print(vif_data[vif_data["Variable"] != "const"].to_string(index=False))
+
+    # --- CHECK 3: EXACT LINEAR COMBINATIONS (R-Squared) ---
+    print("\n3. LINEAR COMBINATION CHECK (Predicting X from Others)")
+    problem_found = False
+    for target in predictors:
+        others = [c for c in predictors if c != target]
+        y = X[target]
+        x_sub = sm.add_constant(X[others])
         
-        # Create a mask to ignore the diagonal (self-correlation is always 1)
-        mask = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
-        high_corr = corr_matrix.where(mask).stack()
+        model = sm.OLS(y, x_sub).fit()
+        r2 = model.rsquared
         
-        # Find pairs with correlation > 0.99
-        perfect_pairs = high_corr[high_corr > 0.99]
-        
-        if not perfect_pairs.empty:
-            for (col1, col2), val in perfect_pairs.items():
-                print(f"   [!] CRITICAL: '{col1}' and '{col2}' are perfectly correlated (r={val:.2f})")
-                print(f"       -> You must remove one of these from your model.")
-        else:
-            print("   -> No perfect correlations found between numeric predictors (Good).")
+        if r2 > 0.99:
+            print(f"   [!] CRITICAL: '{target}' is perfectly predicted by others (R2={r2:.4f})")
+            problem_found = True
+        elif r2 > 0.9:
+            print(f"   [!] WARNING: '{target}' is strongly predicted by others (R2={r2:.4f})")
+    
+    if not problem_found:
+        print("   -> No variable is a perfect linear combination of the others.")
+
+    # --- CHECK 4: MATRIX CONDITION NUMBER ---
+    print("\n4. GLOBAL STABILITY (Condition Number)")
+    # Condition number of the correlation matrix is a standard stability metric
+    # < 100 is good. > 1000 is bad.
+    c_num = cond(X.corr()) 
+    print(f"   Condition Number: {c_num:.2f}")
+    
+    if c_num < 50:
+        print("   -> PASSED. The matrix is extremely stable.")
+    elif c_num < 100:
+        print("   -> PASSED. The matrix is stable enough.")
     else:
-        print("   -> Not enough numeric predictors to check correlation.")
+        print("   -> FAILED. The matrix is unstable/singular.")
 
-    print("\n" + "-"*30 + "\n")
-
-    # CHECK 3: Aliasing with Group (topic_condition)
-    # If a predictor is constant within a group, it might conflict with random effects
-    # or be redundant if topic_condition was treated as fixed.
-    print(f"3. CHECKING ALIASING WITH '{group_col}':")
-    
-    if group_col in df.columns:
-        aliased_found = False
-        for col in predictors:
-            if col in df.columns:
-                # Group by topic and count unique values of the predictor
-                counts = df.groupby(group_col)[col].nunique()
-                
-                # If the maximum unique count is 1, it means for EVERY topic,
-                # this variable has only 1 value (it is a property of the topic).
-                if counts.max() == 1:
-                    print(f"   [!] WARNING: '{col}' is perfectly predicted by '{group_col}'.")
-                    print(f"       -> Inside every topic, '{col}' never changes.")
-                    aliased_found = True
-        
-        if not aliased_found:
-            print(f"   -> Predictors vary independently of '{group_col}' (Good).")
-    else:
-        print(f"   -> Column '{group_col}' not found in dataset.")
-
-    print("\n" + "="*30)
-    print("SUMMARY ADVICE:")
-    print("If you saw [!] CRITICAL errors above, remove those variables from your formula.")
-    print("If you saw [!] WARNINGs about aliasing, ensure your random effects are specified correctly.")
-
-# Run the function
-check_rank_deficiency('hypothesis_data/v3/v3_0.csv')
+thorough_check('hypothesis_data/v3/v3_0.csv')
