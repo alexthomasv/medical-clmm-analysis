@@ -70,6 +70,12 @@ def recode_experience(val):
         return 'Never Used One'
     return s 
 
+def recode_ethnicity_combined(val: str) -> str:
+  s = str(val).strip()
+  if s in ['NO_DATA']:
+      return 'Other'
+  return s
+
 class Hypothesis:
   stmt = ""
   num = 0
@@ -161,7 +167,7 @@ def extract_predictors(data):
     experience_hf        = recode_experience(data_row[1496])
     experience_med       = recode_experience(data_row[1497])
     gender               = data_row[1498]
-    ethnicity_combined   = data_row[1502]
+    ethnicity_combined   = recode_ethnicity_combined(data_row[1502])
     age_bracket          = data_row[1504]
     region_broad         = data_row[1507]
 
