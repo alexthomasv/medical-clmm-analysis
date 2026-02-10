@@ -1,6 +1,10 @@
 # Loads v1/v2 hypothesis
 
-from scipy.stats import kstest, norm, kruskal # Added kruskal
+from scipy.stats import kstest, norm, kruskal 
+# NEW: Import statsmodels for VIF
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.tools.tools import add_constant
 
 # from google.colab import auth
 # auth.authenticate_user()
@@ -10,7 +14,7 @@ import google.auth
 import re
 from collections import defaultdict
 import pandas as pd
-import numpy as np # Added for statistical calculations
+import numpy as np 
 
 from logging import exception
 from functools import reduce
@@ -83,12 +87,13 @@ class Hypothesis:
   ind_vars = []
   dep_vars = []
   interactions = []
-  def __init__(self, ind_vars, dep_vars, interactions, num, formula):
+  def __init__(self, ind_vars, dep_vars, interactions, num, formula, app_topics):
     self.ind_vars = ind_vars
     self.dep_vars = dep_vars
     self.interactions = interactions
     self.num = num
     self.formula = formula
+    self.app_topics = app_topics
 
   def get_base_predictors(self):
       filter = {'usefreq_hf', 'experience_hf', 'gender', 'ethnicity_combined', 'age_bracket', 'region_broad'}
@@ -115,7 +120,7 @@ class Predictor:
     self.predictor = predictor
     self.df = df
 
-def extract_hypothesis_special(hypothesis_final, hypothesis_sheet_name):
+def extract_hypothesis_special(hypothesis_final, hypothesis_sheet_name, app_topics):
   hypothesis_list = []
   hypothesis_rows = hypothesis_final.get_all_values()
   h_idx = 0
@@ -143,7 +148,7 @@ def extract_hypothesis_special(hypothesis_final, hypothesis_sheet_name):
       else:
         ind_vars.append(ind_var)
 
-    hypothesis_list.append(Hypothesis(ind_vars, dep_vars, interactions, hypothesis_sheet_name + "_" + str(h_idx), formula))
+    hypothesis_list.append(Hypothesis(ind_vars, dep_vars, interactions, hypothesis_sheet_name + "_" + str(h_idx), formula, app_topics))
     h_idx += 1
 
   return hypothesis_list
@@ -230,11 +235,10 @@ class Survey:
   def __init__(self, predictor_map):
     self.predictor_map = predictor_map
 
-  def create_local_table(self, hypothesis: Hypothesis):
-    print(hypothesis)
+  def create_local_table(self, hypothesis: Hypothesis, topic_conditions_filter):
+    # print(hypothesis) # Commented out to reduce noise during bulk VIF run
     exceptions = ['purpose_health', 'purpose_sens']
     special = ['region_broad', 'usefreq_med', 'experience_hf', 'experience_med', 'gender', 'ethnicity_combined', 'usefreq_hf', 'age_bracket']
-
 
     ind_vars = []
     ind_vars.extend(hypothesis.ind_vars)
@@ -263,17 +267,22 @@ class Survey:
     dep_var_df = self.predictor_map[dep_var]
     columns = ind_vars_df + [dep_var_df]
 
+    # First merge block
     final = reduce(lambda left, right: pd.merge(left, right, on=['participant_number', 'topic_condition', 'data_practice'] + special, how='inner'), columns)
 
+    # Second merge block (if exceptions exist)
     if exception_predictors_df:
       final = reduce(
           lambda L, R: pd.merge(L, R, on=['participant_number','topic_condition'] + special, how='inner'),
           [final] + exception_predictors_df
       )
     
+    if topic_conditions_filter: 
+        final = final[final['topic_condition'].isin(topic_conditions_filter)]
+
     return final
 
-  def prepare_clmm_data(self, hypothesis_dict, do_full):
+  def prepare_clmm_data(self, hypothesis_dict):
     from pathlib import Path
     cwd = Path.cwd()
     file_prefix_data = cwd / "hypothesis_data"
@@ -289,79 +298,59 @@ class Survey:
         for hypothesis in hypothesis_list:
             hypothesis_name_local = hypothesis.num
             # print(f"Hypothesis: {hypothesis_name_local}")
-            local_table = self.create_local_table(hypothesis)
+            local_table = self.create_local_table(hypothesis, hypothesis.app_topics)
             os.makedirs(f"{file_prefix_data}/{hypothesis_name}", exist_ok=True)
             local_table.to_csv(f"{file_prefix_data}/{hypothesis_name}/{hypothesis.num}.csv", index=False)
-            metadata[hypothesis_name][hypothesis_name_local] = {"ind_vars": hypothesis.ind_vars, "dep_var": hypothesis.dep_vars[0], "interactions": hypothesis.interactions, "base_predictors": list(hypothesis.get_base_predictors()), "do_full": do_full}
+            metadata[hypothesis_name][hypothesis_name_local] = {"ind_vars": hypothesis.ind_vars, "dep_var": hypothesis.dep_vars[0], "interactions": hypothesis.interactions, "base_predictors": list(hypothesis.get_base_predictors())}
             
     with open(f"{file_prefix_metadata}/metadata.json", "w") as f:
         json.dump(metadata, f, indent=4)
 
-
 # ==========================================
-# UPDATED STATISTICS REPORTER
+# STATS REPORTER
 # ==========================================
 class StatsReporter:
-    """
-    Calculates Mean, Median, Mode, Std Dev, and Count.
-    """
     def __init__(self, predictor_map):
         self.predictor_map = predictor_map
 
     def calculate_stats(self):
-        # 1. Consolidate all data into one Master DataFrame first
         all_records = []
         for predictor_name, df in self.predictor_map.items():
             target_col = f"{predictor_name}_target" if f"{predictor_name}_target" in df.columns else predictor_name
-            
-            # Extract only necessary columns and rename for consistency
             temp_df = df[['topic_condition', target_col]].copy()
             temp_df.columns = ['App_Topic', 'Value']
             temp_df['Data_Type'] = predictor_name
-            
-            # Ensure numeric and clean
             temp_df['Value'] = pd.to_numeric(temp_df['Value'], errors='coerce')
             temp_df = temp_df.dropna(subset=['Value'])
-            
             all_records.append(temp_df)
             
         if not all_records:
-            return pd.DataFrame() # Return empty if no data
+            return pd.DataFrame()
 
         master_df = pd.concat(all_records, ignore_index=True)
         report_data = []
 
-        # --- Level 3: Per Data Type (Aggregated across all apps) ---
         for dtype, group in master_df.groupby('Data_Type'):
             stats = self._compute_stats(group['Value'])
             stats.update({'Level': 'All Apps Per Data Type', 'Data Type': dtype, 'App Topic': 'ALL'})
             report_data.append(stats)
 
-        # --- Level 4: Per Data Type + App (Detailed) ---
         for (dtype, app), group in master_df.groupby(['Data_Type', 'App_Topic']):
             stats = self._compute_stats(group['Value'])
             stats.update({'Level': 'Data Type Per App', 'Data Type': dtype, 'App Topic': app})
             report_data.append(stats)
 
-        # Convert to DataFrame
         report_df = pd.DataFrame(report_data)
-
-        # Sort for readability: Level -> Data Type -> App Topic
         report_df = report_df.sort_values(by=['Level', 'Data Type', 'App Topic'])
-
-        # Reorder columns
         cols = ['Level', 'Data Type', 'App Topic', 'Mean', 'Median', 'Mode', 'Std Dev', 'Count']
         cols = [c for c in cols if c in report_df.columns]
-        
         return report_df[cols]
 
     def _compute_stats(self, series):
         if series.empty:
              return {'Mean': np.nan, 'Median': np.nan, 'Mode': np.nan, 'Std Dev': np.nan, 'Count': 0}
-             
         desc = series.describe()
         mode_val = series.mode()
-        
         return {
             'Mean': round(desc['mean'], 2),
             'Median': round(desc['50%'], 2),
@@ -371,55 +360,35 @@ class StatsReporter:
         }
 
 # ==========================================
-# NEW STATISTICAL TESTER (KRUSKAL-WALLIS)
+# STATISTICAL TESTER
 # ==========================================
 class StatTester:
-    """
-    Performs inferential statistics (Kruskal-Wallis) to check for 
-    significant differences across groups (e.g. App Topic).
-    """
     def __init__(self, predictor_map):
         self.predictor_map = predictor_map
 
     def check_app_differences(self, variables_to_test=None):
-        """
-        Runs Kruskal-Wallis H-test on specified variables to see if 
-        distributions differ by 'topic_condition' (App Topic).
-        """
         results = []
-        
-        # Default to all predictors if none specified
         if variables_to_test is None:
             variables_to_test = list(self.predictor_map.keys())
 
         print(f"\n--- Running Kruskal-Wallis Tests (Grouping by App Topic) ---")
-        
         for var_name in variables_to_test:
             if var_name not in self.predictor_map:
                 continue
 
             df = self.predictor_map[var_name]
             target_col = f"{var_name}_target" if f"{var_name}_target" in df.columns else var_name
-
-            # Ensure numeric
             df = df.copy()
             df[target_col] = pd.to_numeric(df[target_col], errors='coerce')
             df = df.dropna(subset=[target_col])
 
-            # Group data by App Topic
-            groups = [
-                group[target_col].values 
-                for name, group in df.groupby('topic_condition')
-            ]
+            groups = [group[target_col].values for name, group in df.groupby('topic_condition')]
 
             if len(groups) < 2:
-                print(f"Skipping {var_name}: Not enough groups to test.")
                 continue
 
-            # Run Test
             try:
                 stat, p_value = kruskal(*groups)
-                
                 significance = ""
                 if p_value < 0.001: significance = "***"
                 elif p_value < 0.01: significance = "**"
@@ -428,18 +397,103 @@ class StatTester:
                 results.append({
                     'Variable': var_name,
                     'H-statistic': round(stat, 3),
-                    'p-value': p_value, # Keep raw for sorting/filtering
+                    'p-value': p_value, 
                     'Significance': significance
                 })
             except Exception as e:
                 print(f"Error testing {var_name}: {e}")
 
-        # Convert to DataFrame
         res_df = pd.DataFrame(results)
         if not res_df.empty:
             res_df = res_df.sort_values(by='p-value')
-            
         return res_df
+
+# ==========================================
+# NEW VIF ANALYZER
+# ==========================================
+class VIFAnalyzer:
+    def __init__(self, survey_instance):
+        self.survey = survey_instance
+
+    def compute_vif_for_hypothesis(self, df, ind_vars):
+        """
+        Calculates VIF for the provided DataFrame and list of independent variables.
+        Automatically handles categorical encoding.
+        """
+        # 1. Filter columns to only those in the hypothesis + available in DF
+        # This handles cases where 'ind_vars' might list main effects but not interactions
+        valid_predictors = [v for v in ind_vars if v in df.columns]
+        
+        if not valid_predictors:
+            return pd.DataFrame()
+
+        # 2. Subset data
+        X = df[valid_predictors].copy()
+
+        # 3. Handle Categoricals: One-Hot Encode (Drop First to avoid dummy trap)
+        cat_cols = X.select_dtypes(include=['object', 'category']).columns
+        if len(cat_cols) > 0:
+            X = pd.get_dummies(X, columns=cat_cols, drop_first=True, dtype=float)
+
+        # 4. Drop missing values
+        X = X.dropna()
+        if X.empty:
+            return pd.DataFrame()
+
+        # 5. Add constant (required for VIF calculation)
+        try:
+            X = sm.add_constant(X, has_constant='add')
+        except Exception:
+            # Fallback if add_constant fails for some reason
+            X['const'] = 1.0
+
+        # 6. Calculate VIF
+        vif_data = []
+        for i in range(X.shape[1]):
+            feature_name = X.columns[i]
+            if feature_name == 'const':
+                continue # Skip intercept
+            
+            try:
+                val = variance_inflation_factor(X.values, i)
+                vif_data.append({
+                    'Predictor': feature_name,
+                    'VIF': round(val, 4)
+                })
+            except Exception as e:
+                vif_data.append({
+                    'Predictor': feature_name,
+                    'VIF': str(e)
+                })
+
+        return pd.DataFrame(vif_data)
+
+    def analyze_all_hypotheses(self, hypothesis_dict):
+        results = []
+        print("\n--- Starting VIF Analysis per Hypothesis ---")
+        
+        for group_name, h_list in hypothesis_dict.items():
+            for h in h_list:
+                # Re-create the specific dataset for this hypothesis
+                # (Same logic as prepare_clmm_data)
+                df = self.survey.create_local_table(h, h.app_topics)
+                
+                # We calculate VIF based on the independent variables defined in the hypothesis
+                # Note: This calculates VIF on main effects. If you have explicit interaction
+                # terms (A*B), standard VIF usually looks at the inputs (A, B).
+                vif_df = self.compute_vif_for_hypothesis(df, h.ind_vars)
+                
+                if not vif_df.empty:
+                    vif_df['Hypothesis Group'] = group_name
+                    vif_df['Hypothesis Num'] = h.num
+                    # Reorder cols
+                    cols = ['Hypothesis Group', 'Hypothesis Num', 'Predictor', 'VIF']
+                    results.append(vif_df[cols])
+        
+        if results:
+            return pd.concat(results, ignore_index=True)
+        return pd.DataFrame()
+
 
 if __name__ == '__main__':
     scopes = [
@@ -454,18 +508,32 @@ if __name__ == '__main__':
 
     sh = gc.open('P2S2 Hypotheses')
     hypothesis_final_v1 = sh.worksheet('v1 of Models')
+    
+    hypothesis_final_v1_low = sh.worksheet('v1 of Models - Low')
+    hypothesis_final_v1_medium = sh.worksheet('v1 of Models - Medium')
+    hypothesis_final_v1_high = sh.worksheet('v1 of Models - High')
+    
     hypothesis_final_v2 = sh.worksheet('v2 of Models')
     hypothesis_final_v3 = sh.worksheet('v3 of Models')
     hypothesis_final_v1_dummy = sh.worksheet('v1_dummy of Models')
     hypothesis_final_v4 = sh.worksheet('v4 of Models')
     hypothesis_final_v6 = sh.worksheet('v6 of Models')
 
-    hypothesis_id = ["v1", "v1_dummy", "v2", "v3", "v4", "v6"]
-    all_hypothesis = [hypothesis_final_v1, hypothesis_final_v1_dummy, hypothesis_final_v2, hypothesis_final_v3, hypothesis_final_v4, hypothesis_final_v6]
+    hypothesis_id = ["v1", "v1_low", "v1_medium", "v1_high", "v1_dummy", "v2", "v3", "v4", "v6"]
+    all_hypothesis = [hypothesis_final_v1, hypothesis_final_v1_low, hypothesis_final_v1_medium, hypothesis_final_v1_high, hypothesis_final_v1_dummy, hypothesis_final_v2, hypothesis_final_v3, hypothesis_final_v4, hypothesis_final_v6]
 
     hypothesis_dict = {}
     for hypothesis_name, hypothesis in zip(hypothesis_id, all_hypothesis):
-        hypothesis_dict[hypothesis_name] = extract_hypothesis_special(hypothesis, hypothesis_name)
+        if hypothesis_name == "v1_low":
+            app_topics = ["Flashlight", "Face Editor", "Kinky Dating"]
+        elif hypothesis_name == "v1_medium":
+            app_topics = ["STI Dating", "Marijuana Shopping", "Blood Donation"]
+        elif hypothesis_name == "v1_high":
+            app_topics = ["Brain Exercises", "Step Counter", "Smart Scale", "STI Help", "Period Tracker"]
+        else:
+            app_topics = []
+
+        hypothesis_dict[hypothesis_name] = extract_hypothesis_special(hypothesis, hypothesis_name, app_topics)
 
     predictor_map = extract_predictors(data_final)
 
@@ -473,7 +541,7 @@ if __name__ == '__main__':
     
     # --- 1. Run Survey Data Prep ---
     survey = Survey(predictor_map)
-    survey.prepare_clmm_data(hypothesis_dict, False)
+    survey.prepare_clmm_data(hypothesis_dict)
 
     # --- 2. Run Statistics Calculation ---
     print("\n" + "="*40)
@@ -482,14 +550,9 @@ if __name__ == '__main__':
     
     reporter = StatsReporter(predictor_map)
     stats_df = reporter.calculate_stats()
-    
-    # Save stats to CSV
     stats_df.to_csv("summary_statistics_per_data_type.csv", index=False)
-    
-    # Print a preview
-    pd.set_option('display.max_rows', 100)
-    pd.set_option('display.width', 1000)
-    print(stats_df.head(30))
+    # pd.set_option('display.max_rows', 100) # Optional display
+    # print(stats_df.head(30))
     print(f"\nFull statistics saved to 'summary_statistics_per_data_type.csv'")
 
     # --- 3. Run Kruskal-Wallis Tests ---
@@ -498,17 +561,27 @@ if __name__ == '__main__':
     print("="*40)
 
     tester = StatTester(predictor_map)
-    
-    # You can specify specific variables if needed, or leave None to test all
-    # target_vars = ['dtype_health', 'dtype_sens', 'purpose_health', 'purpose_sens']
-    # kw_results = tester.check_app_differences(target_vars)
-    
-    # Testing all available numeric variables found in predictor_map
     kw_results = tester.check_app_differences(None) 
 
     if not kw_results.empty:
-        print(kw_results)
+        # print(kw_results)
         kw_results.to_csv("kruskal_wallis_app_differences.csv", index=False)
         print("\nKruskal-Wallis results saved to 'kruskal_wallis_app_differences.csv'")
     else:
         print("No results generated.")
+
+    # --- 4. Run VIF Analysis (NEW) ---
+    print("\n" + "="*40)
+    print("CALCULATING VIF FOR EACH HYPOTHESIS")
+    print("="*40)
+
+    vif_analyzer = VIFAnalyzer(survey)
+    all_vifs = vif_analyzer.analyze_all_hypotheses(hypothesis_dict)
+
+    if not all_vifs.empty:
+        all_vifs.to_csv("vif_results_all_hypotheses.csv", index=False)
+        print("\nVIF Analysis Complete.")
+        print(all_vifs.head(20)) # Preview
+        print("Full VIF results saved to 'vif_results_all_hypotheses.csv'")
+    else:
+        print("No VIF results generated. Check hypothesis variable names or data availability.")
