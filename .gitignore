@@ -3,3 +3,5 @@ blues_r_analysis/
 blues_data/
 metadata/
 *.csv
+heat_map_outputs/
+results/
