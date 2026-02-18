@@ -9,15 +9,21 @@ library(parallel)
 # 1. HELPER FUNCTIONS
 # ==============================================================================
 
-# Standardize variable formatting (numeric scaling vs factors vs contrasts)
 format_var <- function(var, data, linear_only = TRUE, linear_method = "numeric") {
-  if (is.ordered(data[[var]]) && isTRUE(linear_only)) {
+  if (!is.ordered(data[[var]])) {
+    return(sprintf("`%s`", var))
+  }
+
+  if (isTRUE(linear_only)) {
+    # --- OPTION A: SIMPLIFY TO LINEAR ---
     if (linear_method == "contrast") {
       return(sprintf("C(`%s`, poly, 1)", var))
     } else {
+      # User requested scale(as.numeric(...)) for main effects
       return(sprintf("scale(as.numeric(`%s`))", var))
     }
   } else {
+    # --- OPTION B: FULL POLYNOMIAL (L, Q, C) ---
     return(sprintf("`%s`", var))
   }
 }
@@ -26,7 +32,6 @@ format_as_factor <- function(var, data) {
   sprintf("as.factor(`%s`)", var)
 }
 
-# Constructs interaction terms (e.g., "A:B") from a list of vectors
 build_interaction_terms <- function(interaction_list, data, linear_2way = FALSE, linear_3way = FALSE, linear_method = "numeric") {
   if (is.null(interaction_list) || length(interaction_list) == 0) return(character(0))
   if (!is.list(interaction_list)) return(character(0))
@@ -36,23 +41,27 @@ build_interaction_terms <- function(interaction_list, data, linear_2way = FALSE,
     components <- as.character(interaction_list[[i]])
     degree <- length(components)
     
-    # Determine linearity for this specific interaction
     is_linear <- FALSE
     if (degree == 2 && linear_2way) is_linear <- TRUE
     if (degree >= 3 && linear_3way) is_linear <- TRUE
     
-    # Format each component
     formatted_comps <- sapply(components, function(v) {
       if (!v %in% names(data)) return(v) 
       
-      if (is.ordered(data[[v]]) && isTRUE(is_linear)) {
+      if (!is.ordered(data[[v]])) {
+        stop(sprintf("ASSERTION FAILED: Interaction component '%s' is not ordered.", v))
+      }
+
+      if (isTRUE(is_linear)) {
          if (linear_method == "contrast") {
-            sprintf("C(`%s`, poly, 1)", v)
+            # UPDATED: Use poly, 1 to match format_var
+            return(sprintf("C(`%s`, poly, 1)", v))
          } else {
-            sprintf("scale(as.numeric(`%s`))", v)
+            # User provided code used simple as.numeric for interactions (no scale)
+            return(sprintf("as.numeric(`%s`)", v))
          }
       } else {
-        sprintf("`%s`", v)
+         return(sprintf("`%s`", v))
       }
     })
     
@@ -201,10 +210,10 @@ run_all_assumption_tests <- function(metadata, data_prefix, target_groups, outpu
 }
 
 # ==============================================================================
-# 3. PHASE 2: AIC MODEL SELECTION
+# 3. PHASE 2: AIC MODEL SELECTION (UPDATED WITH PER-HYPOTHESIS HISTORY)
 # ==============================================================================
 
-run_aic_selection <- function(metadata, data_prefix, target_groups, output_root) {
+run_aic_selection <- function(metadata, data_prefix, target_groups, target_hypotheses, output_root, linear_method = "numeric") {
   
   json_output_path <- file.path(output_root, "best_models.json")
   if (file.exists(json_output_path)) {
@@ -214,10 +223,21 @@ run_aic_selection <- function(metadata, data_prefix, target_groups, output_root)
 
   if (!is.null(target_groups)) { valid_groups <- intersect(names(metadata), target_groups); metadata <- metadata[valid_groups] }
   flat_metadata <- flatten_metadata_wrapper(metadata)
+  
+  # NEW: Filter by specific hypotheses if provided
+  if (!is.null(target_hypotheses)) {
+      valid_hyps <- intersect(names(flat_metadata), target_hypotheses)
+      flat_metadata <- flat_metadata[valid_hyps]
+      message(sprintf("Filtered to specific hypotheses: %s", paste(valid_hyps, collapse=", ")))
+  }
+
   best_models_map <- list()
-  selection_log_file <- file.path(output_root, "aic_selection_log.csv")
+  
+  # Global summary log (optional, keeps track of final outcomes)
+  global_log_file <- file.path(output_root, "aic_selection_summary.csv")
+  
   mc <- max(1L, if (is.null(getOption("mc.cores"))) parallel::detectCores(logical=TRUE)-1L else as.integer(getOption("mc.cores")))
-  message(sprintf("Running AIC Selection (Linear Assumption) with %d cores...", mc))
+  message(sprintf("Running AIC Selection (Linear Assumption: %s) with %d cores...", linear_method, mc))
 
   for (hnum in names(flat_metadata)) {
     gc()
@@ -225,6 +245,15 @@ run_aic_selection <- function(metadata, data_prefix, target_groups, output_root)
     data_file_path <- file.path(data_prefix, suite_name, paste0(hnum, ".csv"))
     if (!file.exists(data_file_path)) { message(sprintf("Skipping %s (No Data)", hnum)); next }
     message(sprintf("Selecting: %s", hnum))
+    
+    # --- SETUP PER-HYPOTHESIS OUTPUT ---
+    hyp_dir <- file.path(output_root, hnum)
+    if (!dir.exists(hyp_dir)) dir.create(hyp_dir, recursive = TRUE)
+    history_file <- file.path(hyp_dir, "aic_history.csv")
+    
+    # Initialize history CSV
+    cat("Step,Action,AIC,Status,Candidates_Tested,Best_Candidate_AIC\n", file = history_file)
+    # -----------------------------------
     
     hyp_Obj <- flat_metadata[[hnum]]
     dep_var <- hyp_Obj[["dep_var"]]
@@ -239,9 +268,15 @@ run_aic_selection <- function(metadata, data_prefix, target_groups, output_root)
     data[[dep_var]] <- factor(data[[dep_var]], ordered = TRUE)
     data_fixed <- build_data_sub(data, dep_var, all_vars)
 
+    if (linear_method == "contrast") {
+        for (v in names(data_fixed)) {
+            if (is.ordered(data_fixed[[v]])) contrasts(data_fixed[[v]]) <- contr.poly(nlevels(data_fixed[[v]]))
+        }
+    }
+
     build_rhs <- function(kept_preds, kept_inters_list) {
-        main_terms <- vapply(kept_preds, function(v) format_var(v, data, linear_only=TRUE, linear_method="numeric"), character(1))
-        inter_terms <- build_interaction_terms(kept_inters_list, data, linear_2way=TRUE, linear_3way=TRUE, linear_method="numeric")
+        main_terms <- vapply(kept_preds, function(v) format_var(v, data, linear_only=TRUE, linear_method=linear_method), character(1))
+        inter_terms <- build_interaction_terms(kept_inters_list, data, linear_2way=TRUE, linear_3way=TRUE, linear_method=linear_method)
         rhs_vec <- c(main_terms, inter_terms)
         if (length(rhs_vec) == 0) return("1")
         paste(rhs_vec, collapse = " + ")
@@ -253,59 +288,118 @@ run_aic_selection <- function(metadata, data_prefix, target_groups, output_root)
     f_base <- stats::as.formula(paste(dep_var, "~", rhs_str, "+ (1 | topic_condition) + (1 | participant_number) + (1 | data_practice)"))
     
     control <- ordinal::clmm.control(gradTol = 1e-6)
-    fit <- tryCatch(ordinal::clmm(f_base, data = data_fixed, Hess = FALSE, method = "nlminb", control = control), error = function(e) NULL)
+    fit <- tryCatch(ordinal::clmm(f_base, data = data_fixed, Hess = TRUE, method = "nlminb", control = control), error = function(e) NULL) 
     
-    if (is.null(fit)) { message(sprintf("  -> Base model failed for %s", hnum)); next }
-    best_aic <- AIC(fit)
-    
-    if (length(cand_preds_pool) == 0 && length(cand_inters_pool) == 0) {
-        message("  -> No candidates. Saving Base model.")
-        best_models_map[[hnum]] <- list(kept_vars = curr_preds, kept_intrs_list = curr_inters)
-        intr_strs <- sapply(curr_inters, function(x) paste(x, collapse=":"))
-        row_data <- data.frame(hypothesis = hnum, AIC = as.numeric(best_aic), kept_predictors = paste(curr_preds, collapse = "+"), interactions = paste(intr_strs, collapse = "+"))
-        write.table(row_data, file = selection_log_file, append = TRUE, sep = ",", row.names = FALSE, col.names = !file.exists(selection_log_file))
-        next
+    base_ok <- FALSE
+    if (!is.null(fit)) {
+        sum_coef <- summary(fit)$coefficients
+        if (!any(is.nan(sum_coef[, "Std. Error"])) && !any(is.na(sum_coef[, "Std. Error"])) && !any(abs(coef(fit)) > 10)) {
+            base_ok <- TRUE
+        }
     }
 
+    if (!base_ok) { 
+        message(sprintf("  -> Base model failed or unstable for %s (NaN Errors or Separation). Skipping.", hnum)); 
+        cat(sprintf("Base Model,Initial Fit,NA,FAILED,None,NA\n"), file = history_file, append = TRUE)
+        next 
+    }
+    
+    best_aic <- AIC(fit)
+    cat(sprintf("Base Model,Initial Fit,%.2f,Accepted,None,NA\n", best_aic), file = history_file, append = TRUE)
+    
+    # -----------------------------------------------------------
+    # FORWARD SELECTION LOOP
+    # -----------------------------------------------------------
+    step_count <- 1
     improved <- TRUE
+    
     while (improved) {
       improved <- FALSE
       avail_preds <- setdiff(cand_preds_pool, curr_preds)
-      curr_int_strs <- sapply(curr_inters, function(x) paste(sort(x), collapse=":"))
-      pool_int_strs <- sapply(cand_inters_pool, function(x) paste(sort(x), collapse=":"))
-      avail_int_idx <- which(!pool_int_strs %in% curr_int_strs)
       
+      # --- HIERARCHY CHECK START ---
+      valid_int_indices <- integer(0)
+      for (i in seq_along(cand_inters_pool)) {
+          candidate <- cand_inters_pool[[i]]
+          cand_str <- paste(sort(candidate), collapse=":")
+          curr_strs <- sapply(curr_inters, function(x) paste(sort(x), collapse=":"))
+          if (cand_str %in% curr_strs) next
+          
+          is_valid_hierarchy <- TRUE
+          if (!all(candidate %in% curr_preds)) is_valid_hierarchy <- FALSE
+          if (length(candidate) > 2) {
+              sub_inters <- combn(candidate, length(candidate)-1, simplify=FALSE)
+              for (sub in sub_inters) {
+                  sub_str <- paste(sort(sub), collapse=":")
+                  if (!sub_str %in% curr_strs) { is_valid_hierarchy <- FALSE; break }
+              }
+          }
+          if (is_valid_hierarchy) valid_int_indices <- c(valid_int_indices, i)
+      }
+      # --- HIERARCHY CHECK END ---
+      
+      avail_int_idx <- valid_int_indices
+      
+      # Prepare jobs for parallel execution
       jobs <- list()
       for(v in avail_preds) jobs[[length(jobs)+1]] <- list(type="var", val=v)
       for(idx in avail_int_idx) jobs[[length(jobs)+1]] <- list(type="intr", val=cand_inters_pool[[idx]])
       
-      if (length(jobs) == 0) break
+      if (length(jobs) == 0) {
+          cat(sprintf("Step %d,Stop (No Candidates),%.2f,Final,None,NA\n", step_count, best_aic), file = history_file, append = TRUE)
+          break
+      }
       
       trial_results <- parallel::mclapply(jobs, function(job) {
           try_preds <- curr_preds; try_inters <- curr_inters
           if (job$type == "var") { try_preds <- c(try_preds, job$val) } else { try_inters <- c(try_inters, list(job$val)) }
           rhs_try <- build_rhs(try_preds, try_inters)
           f_try <- stats::as.formula(paste(dep_var, "~", rhs_try, "+ (1 | topic_condition) + (1 | participant_number) + (1 | data_practice)"))
-          fit_try <- tryCatch(ordinal::clmm(f_try, data = data_fixed, Hess = FALSE, method = "nlminb", control = control), error = function(e) NULL)
+          
+          fit_try <- tryCatch(ordinal::clmm(f_try, data = data_fixed, Hess = TRUE, method = "nlminb", control = control), error = function(e) NULL)
+          
           if (is.null(fit_try)) return(NULL)
+          
+          # Safety Checks
+          sum_coef <- summary(fit_try)$coefficients
+          if (any(is.nan(sum_coef[, "Std. Error"])) || any(is.na(sum_coef[, "Std. Error"]))) return(NULL) 
+          if (any(abs(coef(fit_try)) > 10)) return(NULL)
+
           list(job=job, aic=AIC(fit_try), preds=try_preds, inters=try_inters)
       }, mc.cores = mc)
       
       trial_results <- Filter(Negate(is.null), trial_results)
-      if (length(trial_results) == 0) break
+      
+      # Format list of candidates tested for the log
+      candidates_tested_str <- paste(sapply(jobs, function(j) if(j$type=="var") j$val else paste(j$val, collapse=":")), collapse="; ")
+      
+      if (length(trial_results) == 0) {
+          cat(sprintf("Step %d,Stop (All Candidates Failed/Unstable),%.2f,Final,\"%s\",NA\n", step_count, best_aic, candidates_tested_str), file = history_file, append = TRUE)
+          break
+      }
+      
       aics <- vapply(trial_results, function(x) x$aic, numeric(1))
       best_idx <- which.min(aics)
+      trial_best_aic <- aics[best_idx]
+      best_try <- trial_results[[best_idx]]
+      added_name <- if(best_try$job$type=="var") best_try$job$val else paste(best_try$job$val, collapse=":")
       
-      if (aics[best_idx] < best_aic) {
-          best_try <- trial_results[[best_idx]]; curr_preds <- best_try$preds; curr_inters <- best_try$inters; best_aic <- best_try$aic
-          added_name <- if(best_try$job$type=="var") best_try$job$val else paste(best_try$job$val, collapse=":")
-          message(sprintf("  -> Added %s (AIC: %.2f)", added_name, best_aic)); improved <- TRUE
+      if (trial_best_aic < best_aic) {
+          curr_preds <- best_try$preds; curr_inters <- best_try$inters; best_aic <- trial_best_aic
+          message(sprintf("  -> Added %s (AIC: %.2f)", added_name, best_aic))
+          cat(sprintf("Step %d,Added %s,%.2f,Accepted,\"%s\",%.2f\n", step_count, added_name, best_aic, candidates_tested_str, trial_best_aic), file = history_file, append = TRUE)
+          improved <- TRUE
+      } else {
+          cat(sprintf("Step %d,Stop (No Improvement),%.2f,Final,\"%s\",%.2f\n", step_count, best_aic, candidates_tested_str, trial_best_aic), file = history_file, append = TRUE)
       }
+      step_count <- step_count + 1
     } 
+    
+    # Save Final Decision for this Hypothesis
     best_models_map[[hnum]] <- list(kept_vars = curr_preds, kept_intrs_list = curr_inters)
     intr_strs <- sapply(curr_inters, function(x) paste(x, collapse=":"))
     row_data <- data.frame(hypothesis = hnum, AIC = as.numeric(best_aic), kept_predictors = paste(curr_preds, collapse = "+"), interactions = paste(intr_strs, collapse = "+"))
-    write.table(row_data, file = selection_log_file, append = TRUE, sep = ",", row.names = FALSE, col.names = !file.exists(selection_log_file))
+    write.table(row_data, file = global_log_file, append = TRUE, sep = ",", row.names = FALSE, col.names = !file.exists(global_log_file))
   }
   write_json(best_models_map, json_output_path, pretty = TRUE, auto_unbox = TRUE)
 }
@@ -314,10 +408,7 @@ run_aic_selection <- function(metadata, data_prefix, target_groups, output_root)
 # 4. PHASE 3: FINAL CLMM FITTING
 # ==============================================================================
 
-# UPDATED: Writes linearity check results to file in output_dir
 perform_linearity_check <- function(final_fit, data, kept_vars, dep_var, control, output_dir) {
-  
-  # Prepare Log File
   log_path <- file.path(output_dir, "linearity_check.txt")
   cat(sprintf("Linearity Check Report for %s\n", dep_var), file = log_path)
   cat("========================================\n", file = log_path, append = TRUE)
@@ -333,10 +424,7 @@ perform_linearity_check <- function(final_fit, data, kept_vars, dep_var, control
           r <- cor(1:(length(idx)+1), c(0, coefs[idx]))
           status <- if(r>0.9) "[PASS]" else if(r>0.7) "[WARN]" else "[FAIL]"
           msg <- sprintf("Linearity Check %-15s: %s (r=%.3f)", v, status, r)
-          
-          # Print to Console
           message(msg)
-          # Write to File
           cat(msg, "\n", file = log_path, append = TRUE)
         }
       }
@@ -362,8 +450,11 @@ reconstruct_best_models_from_csv <- function(csv_path) {
 run_final_fitting <- function(metadata, data_prefix, json_dir, run_dir, 
                               force_linear = FALSE, linear_2way = FALSE, linear_3way = FALSE, linear_method = "numeric") {
     
+    # SAFETY CHECK: PRINT CONFIGURATION
+    message(sprintf(">>> STARTING FINAL FIT WITH CONFIG: linear_method = '%s'", linear_method))
+    
     json_path <- file.path(json_dir, "best_models.json")
-    csv_path  <- file.path(json_dir, "aic_selection_log.csv")
+    csv_path  <- file.path(json_dir, "aic_selection_summary.csv")
     selected_models <- NULL
     
     if (file.exists(json_path)) {
@@ -374,7 +465,7 @@ run_final_fitting <- function(metadata, data_prefix, json_dir, run_dir,
         selected_models <- reconstruct_best_models_from_csv(csv_path)
     }
     
-    if (is.null(selected_models)) stop("Error: Could not find 'best_models.json' or 'aic_selection_log.csv'.")
+    if (is.null(selected_models)) stop("Error: Could not find 'best_models.json' or 'aic_selection_summary.csv'.")
     meta_flat <- flatten_metadata_wrapper(metadata) 
     valid_models <- intersect(names(selected_models), names(meta_flat))
     message(sprintf("\nRunning Final Fitting for %d models (filtered)...", length(valid_models)))
@@ -417,6 +508,15 @@ run_final_fitting <- function(metadata, data_prefix, json_dir, run_dir,
         data[[dep_var]] <- factor(data[[dep_var]], ordered = TRUE)
         data_fixed <- build_data_sub(data, dep_var, all_vars)
         
+        # --- CONDITIONAL ENFORCE POLYNOMIAL CONTRASTS (CRITICAL FIX) ---
+        if (linear_method == "contrast") {
+            for (v in names(data_fixed)) {
+                if (is.ordered(data_fixed[[v]])) {
+                    contrasts(data_fixed[[v]]) <- contr.poly(nlevels(data_fixed[[v]]))
+                }
+            }
+        }
+        
         main_terms <- vapply(kept_vars, function(v) format_var(v, data, linear_only = main_effects_linear, linear_method = linear_method), character(1))
         inter_terms <- build_interaction_terms(kept_intrs_list, data, linear_2way = use_linear_2way, linear_3way = use_linear_3way, linear_method = linear_method)
         rhs_vec <- c(main_terms, inter_terms)
@@ -444,7 +544,6 @@ run_final_fitting <- function(metadata, data_prefix, json_dir, run_dir,
         det_df <- data.frame(Hypothesis = hnum, Term = rownames(coef_summary), Type = ifelse(grepl("\\|", rownames(coef_summary)), "Threshold", "Predictor"), Estimate = estimates, Std_Error = std_errors, Z_Value = coef_summary[, "z value"], P_Value = coef_summary[, "Pr(>|z|)"], Odds_Ratio = exp(estimates), CI_Lower_95 = exp(estimates - 1.96 * std_errors), CI_Upper_95 = exp(estimates + 1.96 * std_errors), stringsAsFactors = FALSE)
         write.table(det_df, file = global_coefs_file, append = TRUE, sep = ",", row.names = FALSE, col.names = !file.exists(global_coefs_file))
         
-        # Pass output_dir (hyp_dir) to save the check file
         perform_linearity_check(fit, data_fixed, kept_vars, dep_var, control, hyp_dir)
     }
 }
@@ -455,17 +554,18 @@ run_final_fitting <- function(metadata, data_prefix, json_dir, run_dir,
 
 # --- CONFIGURATION ---
 DO_ASSUMPTIONS <- FALSE
-DO_SELECTION   <- FALSE
+DO_SELECTION   <- TRUE
 DO_FINAL_FIT   <- TRUE
 
 # Modeling Strategy
-FORCE_LINEAR_FINAL_FIT <- FALSE
+FORCE_LINEAR_FINAL_FIT <- TRUE
 LINEAR_2WAY_INTERACTIONS <- TRUE   # Force 2-way interactions to be linear
 LINEAR_3WAY_INTERACTIONS <- TRUE   # Force 3-way interactions to be linear
-LINEAR_METHOD <- "numeric" 
+LINEAR_METHOD <- "contrast"         # Set to "numeric" for 3rd option (as.numeric) or "contrast" for C(x, poly, 1)
 
 # Filtering
-TARGET_GROUPS  <- NULL 
+TARGET_GROUPS  <- c("v6")  # Filter by Suite (e.g., "v6")
+TARGET_HYPOTHESES <- c("v6_8") # Filter by Specific Hypothesis (e.g., "v6_8"). Set NULL for all.
 TARGET_PREDICTORS <- NULL 
 
 # --- SETUP ---
@@ -521,12 +621,15 @@ if (DO_ASSUMPTIONS) {
 
 if (DO_SELECTION) {
   message("\n--- Step 2: Model Selection (Forward AIC / Linear) ---")
-  run_aic_selection(metadata, data_prefix, NULL, RESULTS_ROOT)
+  # UPDATED: Pass LINEAR_METHOD config
+  run_aic_selection(metadata, data_prefix, TARGET_GROUPS, TARGET_HYPOTHESES, run_dir, linear_method = LINEAR_METHOD)
 }
 
 if (DO_FINAL_FIT) {
   message("\n--- Step 3: Final Fitting (CLMM) ---")
-  run_final_fitting(metadata, data_prefix, json_source_dir, run_dir, 
+  # UPDATED: Use run_dir if selection just ran, otherwise json_source_dir
+  source_dir <- if(DO_SELECTION) run_dir else json_source_dir
+  run_final_fitting(metadata, data_prefix, source_dir, run_dir, 
                     force_linear = FORCE_LINEAR_FINAL_FIT, 
                     linear_2way = LINEAR_2WAY_INTERACTIONS,
                     linear_3way = LINEAR_3WAY_INTERACTIONS,
