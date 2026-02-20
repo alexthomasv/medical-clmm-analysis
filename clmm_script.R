@@ -58,7 +58,7 @@ build_interaction_terms <- function(interaction_list, data, linear_2way = FALSE,
             return(sprintf("C(`%s`, poly, 1)", v))
          } else {
             # User provided code used simple as.numeric for interactions (no scale)
-            return(sprintf("as.numeric(`%s`)", v))
+            return(sprintf("scale(as.numeric(`%s`))", v))
          }
       } else {
          return(sprintf("`%s`", v))
@@ -210,21 +210,20 @@ run_all_assumption_tests <- function(metadata, data_prefix, target_groups, outpu
 }
 
 # ==============================================================================
-# 3. PHASE 2: AIC MODEL SELECTION (UPDATED WITH PER-HYPOTHESIS HISTORY)
+# 3. PHASE 2: EXHAUSTIVE BEST SUBSET SELECTION (HIERARCHY ENFORCED)
 # ==============================================================================
 
 run_aic_selection <- function(metadata, data_prefix, target_groups, target_hypotheses, output_root, linear_method = "numeric") {
   
   json_output_path <- file.path(output_root, "best_models.json")
   if (file.exists(json_output_path)) {
-      message(sprintf("INFO: Found existing %s. Skipping AIC Selection.", json_output_path))
+      message(sprintf("INFO: Found existing %s. Skipping Selection.", json_output_path))
       return()
   }
 
   if (!is.null(target_groups)) { valid_groups <- intersect(names(metadata), target_groups); metadata <- metadata[valid_groups] }
   flat_metadata <- flatten_metadata_wrapper(metadata)
   
-  # NEW: Filter by specific hypotheses if provided
   if (!is.null(target_hypotheses)) {
       valid_hyps <- intersect(names(flat_metadata), target_hypotheses)
       flat_metadata <- flat_metadata[valid_hyps]
@@ -232,28 +231,27 @@ run_aic_selection <- function(metadata, data_prefix, target_groups, target_hypot
   }
 
   best_models_map <- list()
-  
-  # Global summary log (optional, keeps track of final outcomes)
   global_log_file <- file.path(output_root, "aic_selection_summary.csv")
   
   mc <- max(1L, if (is.null(getOption("mc.cores"))) parallel::detectCores(logical=TRUE)-1L else as.integer(getOption("mc.cores")))
-  message(sprintf("Running AIC Selection (Linear Assumption: %s) with %d cores...", linear_method, mc))
+  message(sprintf("Running EXHAUSTIVE Best Subset Selection (Linear Method: %s) with %d cores...", linear_method, mc))
 
   for (hnum in names(flat_metadata)) {
     gc()
     suite_name <- sub("_[0-9]+$", "", hnum)
     data_file_path <- file.path(data_prefix, suite_name, paste0(hnum, ".csv"))
     if (!file.exists(data_file_path)) { message(sprintf("Skipping %s (No Data)", hnum)); next }
-    message(sprintf("Selecting: %s", hnum))
+    message(sprintf("\n>>> Selecting globally optimal model for: %s", hnum))
     
     # --- SETUP PER-HYPOTHESIS OUTPUT ---
     hyp_dir <- file.path(output_root, hnum)
     if (!dir.exists(hyp_dir)) dir.create(hyp_dir, recursive = TRUE)
     history_file <- file.path(hyp_dir, "aic_history.csv")
+    verbose_file <- file.path(hyp_dir, "aic_history_verbose.txt")
     
-    # Initialize history CSV
-    cat("Step,Action,AIC,Status,Candidates_Tested,Best_Candidate_AIC\n", file = history_file)
-    # -----------------------------------
+    cat("Status,Models_Tested,Best_AIC,Best_Model_Terms\n", file = history_file)
+    cat(sprintf("VERBOSE EXHAUSTIVE SELECTION LOG FOR %s\n", hnum), file = verbose_file)
+    cat("===================================================\n", file = verbose_file, append=TRUE)
     
     hyp_Obj <- flat_metadata[[hnum]]
     dep_var <- hyp_Obj[["dep_var"]]
@@ -282,125 +280,150 @@ run_aic_selection <- function(metadata, data_prefix, target_groups, target_hypot
         paste(rhs_vec, collapse = " + ")
     }
     
-    curr_preds <- base_preds
-    curr_inters <- base_inters
-    rhs_str <- build_rhs(curr_preds, curr_inters)
-    f_base <- stats::as.formula(paste(dep_var, "~", rhs_str, "+ (1 | topic_condition) + (1 | participant_number) + (1 | data_practice)"))
-    
     control <- ordinal::clmm.control(gradTol = 1e-6)
-    fit <- tryCatch(ordinal::clmm(f_base, data = data_fixed, Hess = TRUE, method = "nlminb", control = control), error = function(e) NULL) 
+
+    # -----------------------------------------------------------
+    # 1. GENERATE ALL SUBSETS AND FILTER BY HIERARCHY
+    # -----------------------------------------------------------
+    n_preds <- length(cand_preds_pool)
+    n_inters <- length(cand_inters_pool)
+    total_cands <- n_preds + n_inters
     
-    base_ok <- FALSE
-    if (!is.null(fit)) {
-        sum_coef <- summary(fit)$coefficients
-        if (!any(is.nan(sum_coef[, "Std. Error"])) && !any(is.na(sum_coef[, "Std. Error"])) && !any(abs(coef(fit)) > 10)) {
-            base_ok <- TRUE
+    if (total_cands > 16) {
+        warning(sprintf("Hypothesis %s has %d candidate terms. Generating 2^%d combinations. This may take a very long time.", hnum, total_cands, total_cands))
+    }
+    
+    # Generate boolean matrix of all 2^N combinations
+    all_combos <- expand.grid(rep(list(c(FALSE, TRUE)), total_cands))
+    valid_jobs <- list()
+    
+    message("  -> Generating and validating hierarchy for all theoretical combinations...")
+    
+    for (i in 1:nrow(all_combos)) {
+        sel_bool <- as.logical(all_combos[i, ])
+        sel_preds <- cand_preds_pool[sel_bool[1:n_preds]]
+        sel_inters <- cand_inters_pool[sel_bool[(n_preds + 1):total_cands]]
+        
+        test_preds <- unique(c(base_preds, sel_preds))
+        test_inters <- c(base_inters, sel_inters)
+        
+        # Deduplicate interactions based on sorted variables
+        if (length(test_inters) > 0) {
+            inter_strs <- sapply(test_inters, function(x) paste(sort(x), collapse=":"))
+            test_inters <- test_inters[!duplicated(inter_strs)]
+        }
+        
+        # --- HIERARCHY VERIFICATION ---
+        is_valid <- TRUE
+        curr_inter_strs <- sapply(test_inters, function(x) paste(sort(x), collapse=":"))
+        
+        for (int in test_inters) {
+            # Check 1: Are all main effects of this interaction present?
+            if (!all(int %in% test_preds)) {
+                is_valid <- FALSE
+                break
+            }
+            # Check 2: If 3-way or higher, are all lower-order interactions present?
+            if (length(int) > 2) {
+                for (degree in 2:(length(int)-1)) {
+                    sub_combs <- combn(int, degree, simplify=FALSE)
+                    for (sub in sub_combs) {
+                        sub_str <- paste(sort(sub), collapse=":")
+                        if (!(sub_str %in% curr_inter_strs)) {
+                            is_valid <- FALSE
+                            break
+                        }
+                    }
+                    if (!is_valid) break
+                }
+            }
+            if (!is_valid) break
+        }
+        
+        if (is_valid) {
+            adds <- c(sel_preds, sapply(sel_inters, function(x) paste(sort(x), collapse=":")))
+            job_name <- if (length(adds) == 0) "Base Model (No Additions)" else paste(adds, collapse=" + ")
+            
+            valid_jobs[[length(valid_jobs)+1]] <- list(
+                preds = test_preds,
+                inters = test_inters,
+                name = job_name
+            )
         }
     }
+    
+    message(sprintf("  -> Reduced %d theoretical combinations to %d hierarchically valid models.", nrow(all_combos), length(valid_jobs)))
+    cat(sprintf("Evaluating %d hierarchically valid combinations out of %d possible.\n\n", length(valid_jobs), nrow(all_combos)), file = verbose_file, append=TRUE)
 
-    if (!base_ok) { 
-        message(sprintf("  -> Base model failed or unstable for %s (NaN Errors or Separation). Skipping.", hnum)); 
-        cat(sprintf("Base Model,Initial Fit,NA,FAILED,None,NA\n"), file = history_file, append = TRUE)
-        next 
+    # -----------------------------------------------------------
+    # 2. EVALUATE ALL VALID MODELS IN PARALLEL
+    # -----------------------------------------------------------
+    message("  -> Fitting all valid CLMM models. This may take time...")
+    
+    trial_results <- parallel::mclapply(valid_jobs, function(job) {
+        rhs_try <- build_rhs(job$preds, job$inters)
+        f_try <- stats::as.formula(paste(dep_var, "~", rhs_try, "+ (1 | topic_condition) + (1 | participant_number) + (1 | data_practice)"))
+        
+        fit_try <- tryCatch(ordinal::clmm(f_try, data = data_fixed, Hess = TRUE, method = "nlminb", control = control), error = function(e) e)
+        
+        res_obj <- list(name=job$name, formula=deparse(f_try), status="OK", aic=Inf, preds=job$preds, inters=job$inters)
+
+        if (inherits(fit_try, "error")) {
+            res_obj$status <- "ERROR"
+            return(res_obj)
+        }
+        
+        # Safety Checks for Separation / NaN
+        sum_coef <- summary(fit_try)$coefficients
+        if (any(is.nan(sum_coef[, "Std. Error"])) || any(is.na(sum_coef[, "Std. Error"]))) {
+            res_obj$status <- "REJECTED (NaN Std. Error)"
+            return(res_obj)
+        } 
+        if (any(abs(coef(fit_try)) > 10)) {
+            res_obj$status <- "REJECTED (Separation/Exploding Coef)"
+            return(res_obj)
+        }
+
+        res_obj$aic <- AIC(fit_try)
+        return(res_obj)
+        
+    }, mc.cores = mc)
+    
+    # -----------------------------------------------------------
+    # 3. FIND THE GLOBAL OPTIMUM
+    # -----------------------------------------------------------
+    best_aic <- Inf
+    best_try <- NULL
+    candidates_tested <- 0
+    
+    for(res in trial_results) {
+        if (is.null(res)) next 
+        candidates_tested <- candidates_tested + 1
+        cat(sprintf("\nModel: Base + %s\nStatus: %s\nAIC: %s\nFormula: %s\n", res$name, res$status, ifelse(is.infinite(res$aic), "NA", sprintf("%.2f", res$aic)), paste(res$formula, collapse="")), file = verbose_file, append=TRUE)
+        
+        if (res$status == "OK" && res$aic < best_aic) {
+            best_aic <- res$aic
+            best_try <- res
+        }
     }
     
-    best_aic <- AIC(fit)
-    cat(sprintf("Base Model,Initial Fit,%.2f,Accepted,None,NA\n", best_aic), file = history_file, append = TRUE)
+    if (is.null(best_try)) {
+        message("  -> ERROR: All theoretical models failed to converge or were unstable.")
+        cat(sprintf("FAILED,%d,NA,All Models Failed\n", candidates_tested), file = history_file, append = TRUE)
+        next
+    }
     
-    # -----------------------------------------------------------
-    # FORWARD SELECTION LOOP
-    # -----------------------------------------------------------
-    step_count <- 1
-    improved <- TRUE
+    # Log the Global Winner
+    message(sprintf("  -> Global Optimum Found! AIC: %.2f | Additions: %s", best_aic, best_try$name))
+    cat(sprintf("\n===================================================\n*** GLOBAL WINNER: %s (AIC: %.2f) ***\n", best_try$name, best_aic), file = verbose_file, append=TRUE)
+    cat(sprintf("SUCCESS,%d,%.2f,\"%s\"\n", candidates_tested, best_aic, best_try$name), file = history_file, append = TRUE)
     
-    while (improved) {
-      improved <- FALSE
-      avail_preds <- setdiff(cand_preds_pool, curr_preds)
-      
-      # --- HIERARCHY CHECK START ---
-      valid_int_indices <- integer(0)
-      for (i in seq_along(cand_inters_pool)) {
-          candidate <- cand_inters_pool[[i]]
-          cand_str <- paste(sort(candidate), collapse=":")
-          curr_strs <- sapply(curr_inters, function(x) paste(sort(x), collapse=":"))
-          if (cand_str %in% curr_strs) next
-          
-          is_valid_hierarchy <- TRUE
-          if (!all(candidate %in% curr_preds)) is_valid_hierarchy <- FALSE
-          if (length(candidate) > 2) {
-              sub_inters <- combn(candidate, length(candidate)-1, simplify=FALSE)
-              for (sub in sub_inters) {
-                  sub_str <- paste(sort(sub), collapse=":")
-                  if (!sub_str %in% curr_strs) { is_valid_hierarchy <- FALSE; break }
-              }
-          }
-          if (is_valid_hierarchy) valid_int_indices <- c(valid_int_indices, i)
-      }
-      # --- HIERARCHY CHECK END ---
-      
-      avail_int_idx <- valid_int_indices
-      
-      # Prepare jobs for parallel execution
-      jobs <- list()
-      for(v in avail_preds) jobs[[length(jobs)+1]] <- list(type="var", val=v)
-      for(idx in avail_int_idx) jobs[[length(jobs)+1]] <- list(type="intr", val=cand_inters_pool[[idx]])
-      
-      if (length(jobs) == 0) {
-          cat(sprintf("Step %d,Stop (No Candidates),%.2f,Final,None,NA\n", step_count, best_aic), file = history_file, append = TRUE)
-          break
-      }
-      
-      trial_results <- parallel::mclapply(jobs, function(job) {
-          try_preds <- curr_preds; try_inters <- curr_inters
-          if (job$type == "var") { try_preds <- c(try_preds, job$val) } else { try_inters <- c(try_inters, list(job$val)) }
-          rhs_try <- build_rhs(try_preds, try_inters)
-          f_try <- stats::as.formula(paste(dep_var, "~", rhs_try, "+ (1 | topic_condition) + (1 | participant_number) + (1 | data_practice)"))
-          
-          fit_try <- tryCatch(ordinal::clmm(f_try, data = data_fixed, Hess = TRUE, method = "nlminb", control = control), error = function(e) NULL)
-          
-          if (is.null(fit_try)) return(NULL)
-          
-          # Safety Checks
-          sum_coef <- summary(fit_try)$coefficients
-          if (any(is.nan(sum_coef[, "Std. Error"])) || any(is.na(sum_coef[, "Std. Error"]))) return(NULL) 
-          if (any(abs(coef(fit_try)) > 10)) return(NULL)
-
-          list(job=job, aic=AIC(fit_try), preds=try_preds, inters=try_inters)
-      }, mc.cores = mc)
-      
-      trial_results <- Filter(Negate(is.null), trial_results)
-      
-      # Format list of candidates tested for the log
-      candidates_tested_str <- paste(sapply(jobs, function(j) if(j$type=="var") j$val else paste(j$val, collapse=":")), collapse="; ")
-      
-      if (length(trial_results) == 0) {
-          cat(sprintf("Step %d,Stop (All Candidates Failed/Unstable),%.2f,Final,\"%s\",NA\n", step_count, best_aic, candidates_tested_str), file = history_file, append = TRUE)
-          break
-      }
-      
-      aics <- vapply(trial_results, function(x) x$aic, numeric(1))
-      best_idx <- which.min(aics)
-      trial_best_aic <- aics[best_idx]
-      best_try <- trial_results[[best_idx]]
-      added_name <- if(best_try$job$type=="var") best_try$job$val else paste(best_try$job$val, collapse=":")
-      
-      if (trial_best_aic < best_aic) {
-          curr_preds <- best_try$preds; curr_inters <- best_try$inters; best_aic <- trial_best_aic
-          message(sprintf("  -> Added %s (AIC: %.2f)", added_name, best_aic))
-          cat(sprintf("Step %d,Added %s,%.2f,Accepted,\"%s\",%.2f\n", step_count, added_name, best_aic, candidates_tested_str, trial_best_aic), file = history_file, append = TRUE)
-          improved <- TRUE
-      } else {
-          cat(sprintf("Step %d,Stop (No Improvement),%.2f,Final,\"%s\",%.2f\n", step_count, best_aic, candidates_tested_str, trial_best_aic), file = history_file, append = TRUE)
-      }
-      step_count <- step_count + 1
-    } 
-    
-    # Save Final Decision for this Hypothesis
-    best_models_map[[hnum]] <- list(kept_vars = curr_preds, kept_intrs_list = curr_inters)
-    intr_strs <- sapply(curr_inters, function(x) paste(x, collapse=":"))
-    row_data <- data.frame(hypothesis = hnum, AIC = as.numeric(best_aic), kept_predictors = paste(curr_preds, collapse = "+"), interactions = paste(intr_strs, collapse = "+"))
+    best_models_map[[hnum]] <- list(kept_vars = best_try$preds, kept_intrs_list = best_try$inters)
+    intr_strs <- sapply(best_try$inters, function(x) paste(x, collapse=":"))
+    row_data <- data.frame(hypothesis = hnum, AIC = as.numeric(best_aic), kept_predictors = paste(best_try$preds, collapse = "+"), interactions = paste(intr_strs, collapse = "+"))
     write.table(row_data, file = global_log_file, append = TRUE, sep = ",", row.names = FALSE, col.names = !file.exists(global_log_file))
   }
+  
   write_json(best_models_map, json_output_path, pretty = TRUE, auto_unbox = TRUE)
 }
 
@@ -555,17 +578,17 @@ run_final_fitting <- function(metadata, data_prefix, json_dir, run_dir,
 # --- CONFIGURATION ---
 DO_ASSUMPTIONS <- FALSE
 DO_SELECTION   <- TRUE
-DO_FINAL_FIT   <- TRUE
+DO_FINAL_FIT   <- FALSE
 
 # Modeling Strategy
 FORCE_LINEAR_FINAL_FIT <- TRUE
 LINEAR_2WAY_INTERACTIONS <- TRUE   # Force 2-way interactions to be linear
 LINEAR_3WAY_INTERACTIONS <- TRUE   # Force 3-way interactions to be linear
-LINEAR_METHOD <- "contrast"         # Set to "numeric" for 3rd option (as.numeric) or "contrast" for C(x, poly, 1)
+LINEAR_METHOD <- "numeric"         # Set to "numeric" for 3rd option (as.numeric) or "contrast" for C(x, poly, 1)
 
 # Filtering
-TARGET_GROUPS  <- c("v6")  # Filter by Suite (e.g., "v6")
-TARGET_HYPOTHESES <- c("v6_8") # Filter by Specific Hypothesis (e.g., "v6_8"). Set NULL for all.
+TARGET_GROUPS  <- NULL  # Filter by Suite (e.g., "v6")
+TARGET_HYPOTHESES <- NULL # Filter by Specific Hypothesis (e.g., "v6_8"). Set NULL for all.
 TARGET_PREDICTORS <- NULL 
 
 # --- SETUP ---
