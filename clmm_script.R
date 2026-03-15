@@ -129,6 +129,34 @@ get_all_vars_from_hyp <- function(hyp_Obj) {
     unique(c(base_p, cand_p, base_i, cand_i))
 }
 
+RANDOM_EFFECTS <- "(1 | topic_condition) + (1 | participant_number) + (1 | data_practice)"
+
+get_data_file_path <- function(hnum, data_prefix) {
+  suite_name <- sub("_[0-9]+$", "", hnum)
+  file.path(data_prefix, suite_name, paste0(hnum, ".csv"))
+}
+
+load_and_prepare_data <- function(data_file_path, dep_var, all_vars) {
+  data <- read.csv(data_file_path, check.names = FALSE)
+  for (v in all_vars) if (v %in% names(data)) data[[v]] <- cast_by_name(data[[v]], v)
+  data[[dep_var]] <- factor(data[[dep_var]], ordered = TRUE)
+  data_fixed <- build_data_sub(data, dep_var, all_vars)
+  list(raw = data, fixed = data_fixed)
+}
+
+apply_poly_contrasts <- function(data_fixed, dep_var) {
+  for (v in names(data_fixed)) {
+    if (v != dep_var && is.ordered(data_fixed[[v]])) {
+      contrasts(data_fixed[[v]]) <- contr.poly(nlevels(data_fixed[[v]]))
+    }
+  }
+  data_fixed
+}
+
+make_clmm_formula <- function(dep_var, rhs_str) {
+  stats::as.formula(paste(dep_var, "~", rhs_str, "+", RANDOM_EFFECTS))
+}
+
 can_add_interaction <- function(candidate_inter, curr_preds, curr_inters) {
     # Check that all main effects are present
     if (!all(candidate_inter %in% curr_preds)) return(FALSE)
@@ -163,24 +191,19 @@ run_all_assumption_tests <- function(metadata, data_prefix, target_groups, outpu
   flat_metadata <- flatten_metadata_wrapper(metadata)
   
   for (hnum in names(flat_metadata)) {
-    suite_name <- sub("_[0-9]+$", "", hnum)
-    data_file_path <- file.path(data_prefix, suite_name, paste0(hnum, ".csv"))
+    data_file_path <- get_data_file_path(hnum, data_prefix)
     if (!file.exists(data_file_path)) next
     cat(sprintf(">>> Checking Hypothesis: %s\n", hnum), file = result_file, append = TRUE)
-    
+
     hyp_Obj <- flat_metadata[[hnum]]
     dep_var <- hyp_Obj[["dep_var"]]
     all_vars <- get_all_vars_from_hyp(hyp_Obj)
-    
-    data <- read.csv(data_file_path, check.names = FALSE)
-    for (v in all_vars) if (v %in% names(data)) data[[v]] <- cast_by_name(data[[v]], v)
-    data[[dep_var]] <- factor(data[[dep_var]], ordered = TRUE)
-    
-    do_linear_only <- TRUE 
-    data_fixed <- build_data_sub(data, dep_var, all_vars)
+
+    prepared <- load_and_prepare_data(data_file_path, dep_var, all_vars)
+    data <- prepared$raw; data_fixed <- prepared$fixed
     vars_to_test <- unique(c(unlist(hyp_Obj[["base_predictors"]]), unlist(hyp_Obj[["candidate_terms_predictors"]])))
     
-    get_term_str <- function(v) format_var(v, data, linear_only = do_linear_only, linear_method = "numeric")
+    get_term_str <- function(v) format_var(v, data, linear_only = TRUE, linear_method = "numeric")
     all_terms <- vapply(vars_to_test, get_term_str, character(1))
     rhs_str <- paste(all_terms, collapse = " + ")
     if (rhs_str == "") rhs_str <- "1"
@@ -193,33 +216,26 @@ run_all_assumption_tests <- function(metadata, data_prefix, target_groups, outpu
         next 
     }
     
-    cat("   [A] Proportional Odds Test (Proxy via CLM)\n", file = result_file, append = TRUE)
-    for (v in vars_to_test) {
-        f_nom <- as.formula(paste("~", get_term_str(v)))
-        fit_nom <- tryCatch(ordinal::clm(f_clm_base, nominal = f_nom, data = data_fixed), error = function(e) NULL)
-        if (is.null(fit_nom)) { 
-            cat(sprintf("       %-20s: [FAIL] Model failed\n", v), file = result_file, append = TRUE) 
-        } else {
-             res <- anova(fit_clm_base, fit_nom)
-             pval <- res$`Pr(>Chisq)`[2]
-             sig <- if (!is.na(pval) && pval < 0.05) "**VIOLATION**" else "Pass"
-             cat(sprintf("       %-20s: p=%.4f [%s]\n", v, pval, sig), file = result_file, append = TRUE)
+    run_single_assumption_test <- function(test_name, test_type) {
+        cat(sprintf("   [%s]\n", test_name), file = result_file, append = TRUE)
+        for (v in vars_to_test) {
+            f_test <- as.formula(paste("~", get_term_str(v)))
+            args <- list(f_clm_base, data = data_fixed)
+            args[[test_type]] <- f_test
+            fit_test <- tryCatch(do.call(ordinal::clm, args), error = function(e) NULL)
+            if (is.null(fit_test)) {
+                cat(sprintf("       %-20s: [FAIL] Model failed\n", v), file = result_file, append = TRUE)
+            } else {
+                res <- anova(fit_clm_base, fit_test)
+                pval <- res$`Pr(>Chisq)`[2]
+                sig <- if (!is.na(pval) && pval < 0.05) "**VIOLATION**" else "Pass"
+                cat(sprintf("       %-20s: p=%.4f [%s]\n", v, pval, sig), file = result_file, append = TRUE)
+            }
         }
     }
-    
-    cat("   [B] Scale/Variance Test (Proxy via CLM)\n", file = result_file, append = TRUE)
-    for (v in vars_to_test) {
-        f_scale <- as.formula(paste("~", get_term_str(v)))
-        fit_scale <- tryCatch(ordinal::clm(f_clm_base, scale = f_scale, data = data_fixed), error = function(e) NULL)
-        if (is.null(fit_scale)) { 
-            cat(sprintf("       %-20s: [FAIL] Model failed\n", v), file = result_file, append = TRUE) 
-        } else {
-             res <- anova(fit_clm_base, fit_scale)
-             pval <- res$`Pr(>Chisq)`[2]
-             sig <- if (!is.na(pval) && pval < 0.05) "**VIOLATION**" else "Pass"
-             cat(sprintf("       %-20s: p=%.4f [%s]\n", v, pval, sig), file = result_file, append = TRUE)
-        }
-    }
+
+    run_single_assumption_test("A] Proportional Odds Test (Proxy via CLM)", "nominal")
+    run_single_assumption_test("B] Scale/Variance Test (Proxy via CLM)", "scale")
     cat("\n", file = result_file, append = TRUE)
   }
 }
@@ -253,8 +269,7 @@ run_aic_selection <- function(metadata, data_prefix, target_groups, target_hypot
 
   for (hnum in names(flat_metadata)) {
     gc()
-    suite_name <- sub("_[0-9]+$", "", hnum)
-    data_file_path <- file.path(data_prefix, suite_name, paste0(hnum, ".csv"))
+    data_file_path <- get_data_file_path(hnum, data_prefix)
     if (!file.exists(data_file_path)) { message(sprintf("Skipping %s (No Data)", hnum)); next }
     message(sprintf("\n>>> Forward selection for: %s", hnum))
 
@@ -276,16 +291,10 @@ run_aic_selection <- function(metadata, data_prefix, target_groups, target_hypot
     cand_inters_pool <- hyp_Obj[["candidate_terms_interactions"]]
 
     all_vars <- get_all_vars_from_hyp(hyp_Obj)
-    data <- read.csv(data_file_path, check.names = FALSE)
-    for (v in all_vars) if (v %in% names(data)) data[[v]] <- cast_by_name(data[[v]], v)
-    data[[dep_var]] <- factor(data[[dep_var]], ordered = TRUE)
-    data_fixed <- build_data_sub(data, dep_var, all_vars)
+    prepared <- load_and_prepare_data(data_file_path, dep_var, all_vars)
+    data <- prepared$raw; data_fixed <- prepared$fixed
 
-    if (linear_method == "contrast") {
-        for (v in names(data_fixed)) {
-            if (v != dep_var && is.ordered(data_fixed[[v]])) contrasts(data_fixed[[v]]) <- contr.poly(nlevels(data_fixed[[v]]))
-        }
-    }
+    if (linear_method == "contrast") data_fixed <- apply_poly_contrasts(data_fixed, dep_var)
 
     build_rhs <- function(kept_preds, kept_inters_list) {
         main_terms <- vapply(kept_preds, function(v) format_var(v, data, linear_only=TRUE, linear_method=linear_method), character(1))
@@ -303,7 +312,7 @@ run_aic_selection <- function(metadata, data_prefix, target_groups, target_hypot
     curr_preds <- base_preds
     curr_inters <- base_inters
     rhs_str <- build_rhs(curr_preds, curr_inters)
-    f_base <- stats::as.formula(paste(dep_var, "~", rhs_str, "+ (1 | topic_condition) + (1 | participant_number) + (1 | data_practice)"))
+    f_base <- make_clmm_formula(dep_var, rhs_str)
 
     fit <- tryCatch(ordinal::clmm(f_base, data = data_fixed, Hess = FALSE, method = "nlminb", control = control), error = function(e) NULL)
 
@@ -367,7 +376,7 @@ run_aic_selection <- function(metadata, data_prefix, target_groups, target_hypot
           try_preds <- curr_preds; try_inters <- curr_inters
           if (job$type == "var") { try_preds <- c(try_preds, job$val) } else { try_inters <- c(try_inters, list(job$val)) }
           rhs_try <- build_rhs(try_preds, try_inters)
-          f_try <- stats::as.formula(paste(dep_var, "~", rhs_try, "+ (1 | topic_condition) + (1 | participant_number) + (1 | data_practice)"))
+          f_try <- make_clmm_formula(dep_var, rhs_try)
 
           fit_try <- tryCatch(ordinal::clmm(f_try, data = data_fixed, Hess = FALSE, method = "nlminb", control = control), error = function(e) NULL)
 
@@ -451,7 +460,7 @@ perform_linearity_check <- function(final_fit, data, kept_vars, dep_var, control
   
   for (v in kept_vars) {
     if (is.ordered(data[[v]])) {
-      f_check <- stats::as.formula(paste(dep_var, "~", format_as_factor(v, data), "+ (1 | topic_condition) + (1 | participant_number) + (1 | data_practice)"))
+      f_check <- make_clmm_formula(dep_var, format_as_factor(v, data))
       fit_check <- tryCatch(ordinal::clmm(f_check, data = data, Hess = FALSE, method = "nlminb", control = control), error = function(e) NULL)
       if (!is.null(fit_check)) {
         coefs <- coef(fit_check)
@@ -535,23 +544,12 @@ run_final_fitting <- function(metadata, data_prefix, json_dir, run_dir,
         hyp_Obj <- meta_flat[[hnum]]
         dep_var <- hyp_Obj[["dep_var"]]
         
-        suite_name <- sub("_[0-9]+$", "", hnum)
-        data_file_path <- file.path(data_prefix, suite_name, paste0(hnum, ".csv"))
-        data <- read.csv(data_file_path, check.names = FALSE)
-        
+        data_file_path <- get_data_file_path(hnum, data_prefix)
         all_vars <- unique(c(dep_var, kept_vars, unlist(kept_intrs_list)))
-        for (v in all_vars) if (v %in% names(data)) data[[v]] <- cast_by_name(data[[v]], v)
-        data[[dep_var]] <- factor(data[[dep_var]], ordered = TRUE)
-        data_fixed <- build_data_sub(data, dep_var, all_vars)
-        
-        # --- CONDITIONAL ENFORCE POLYNOMIAL CONTRASTS ---
-        if (linear_method == "contrast") {
-            for (v in names(data_fixed)) {
-                if (v != dep_var && is.ordered(data_fixed[[v]])) {
-                    contrasts(data_fixed[[v]]) <- contr.poly(nlevels(data_fixed[[v]]))
-                }
-            }
-        }
+        prepared <- load_and_prepare_data(data_file_path, dep_var, all_vars)
+        data <- prepared$raw; data_fixed <- prepared$fixed
+
+        if (linear_method == "contrast") data_fixed <- apply_poly_contrasts(data_fixed, dep_var)
         
         main_terms <- vapply(kept_vars, function(v) format_var(v, data, linear_only = main_effects_linear, linear_method = linear_method), character(1))
         inter_terms <- build_interaction_terms(kept_intrs_list, data, linear_2way = use_linear_2way, linear_3way = use_linear_3way, linear_method = linear_method)
@@ -559,7 +557,7 @@ run_final_fitting <- function(metadata, data_prefix, json_dir, run_dir,
         if (length(rhs_vec) == 0) rhs_vec <- "1"
         rhs_str <- paste(rhs_vec, collapse = " + ")
         
-        f_final <- stats::as.formula(paste(dep_var, "~", rhs_str, "+ (1 | topic_condition) + (1 | participant_number) + (1 | data_practice)"))
+        f_final <- make_clmm_formula(dep_var, rhs_str)
         
         # Try with gradTol=1e-6 first, fall back to default if Hessian fails
         control_tight <- ordinal::clmm.control(gradTol = 1e-6)
@@ -593,6 +591,8 @@ run_final_fitting <- function(metadata, data_prefix, json_dir, run_dir,
 # ==============================================================================
 # 5. DRIVER
 # ==============================================================================
+
+if (sys.nframe() == 0) {  # Only run when executed directly, not when sourced
 
 # --- CONFIGURATION ---
 DO_ASSUMPTIONS <- TRUE
@@ -683,3 +683,5 @@ if (DO_FINAL_FIT) {
 }
 
 message("\nAll tasks complete. Results in: ", run_dir)
+
+}  # end if (sys.nframe() == 0)
