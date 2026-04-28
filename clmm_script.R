@@ -16,8 +16,12 @@ format_var <- function(var, data, linear_only = TRUE, linear_method = "numeric")
     # --- OPTION A: SIMPLIFY TO LINEAR ---
     if (linear_method == "contrast") {
       return(sprintf("C(`%s`, poly, 1)", var))
+    } else if (linear_method == "median_centered") {
+      # Median-centering: subtract median, do not divide by SD.
+      # I() is REQUIRED — without it, the formula parser interprets `-` as formula-removal.
+      return(sprintf("I(as.numeric(`%s`) - median(as.numeric(`%s`), na.rm = TRUE))", var, var))
     } else {
-      # User requested scale(as.numeric(...)) for main effects
+      # Default ("numeric"): scale(as.numeric(...)) — z-scores (centers AND scales)
       return(sprintf("scale(as.numeric(`%s`))", var))
     }
   } else {
@@ -54,6 +58,8 @@ build_interaction_terms <- function(interaction_list, data, linear_2way = FALSE,
          if (linear_method == "contrast") {
             # UPDATED: Use poly, 1 to match format_var
             return(sprintf("C(`%s`, poly, 1)", v))
+         } else if (linear_method == "median_centered") {
+            return(sprintf("I(as.numeric(`%s`) - median(as.numeric(`%s`), na.rm = TRUE))", v, v))
          } else {
             # User provided code used simple as.numeric for interactions (no scale)
             return(sprintf("scale(as.numeric(`%s`))", v))
@@ -72,7 +78,7 @@ cast_by_name <- function(x, name) {
   lev_usefreq     <- c("Less than once a year","A few times a year", "A few times a month","A few times a week","Daily")
   lev_gender      <- c("Woman","Man","Non-binary")
   lev_ethnicity   <- c("White","Asian","Black","Latino/Hispanic","Mixed","Other")
-  lev_age         <- c("18-20","21-44","45-64","65+")
+  lev_age         <- c("18-25","26-40","41-60","61+")
   lev_region      <- c("South","Northeast","West","Midwest")
   lev_experience_hf <- c("Goodish", "Baddish", "Never Used One")
   lev_experience_med <- c("Goodish", "Baddish", "Never Used One")
@@ -596,14 +602,14 @@ if (sys.nframe() == 0) {  # Only run when executed directly, not when sourced
 
 # --- CONFIGURATION ---
 DO_ASSUMPTIONS <- TRUE
-DO_SELECTION   <- FALSE
+DO_SELECTION   <- TRUE
 DO_FINAL_FIT   <- TRUE
 
 # Modeling Strategy
 FORCE_LINEAR_FINAL_FIT <- TRUE
 LINEAR_2WAY_INTERACTIONS <- TRUE   # Force 2-way interactions to be linear
 LINEAR_3WAY_INTERACTIONS <- TRUE   # Force 3-way interactions to be linear
-LINEAR_METHOD <- "contrast"         # Set to "numeric" for 3rd option (as.numeric) or "contrast" for C(x, poly, 1)
+LINEAR_METHOD <- "median_centered"  # TEMPORARY: median-centered numeric run for comparison; revert to "contrast" after.
 
 # Filtering
 TARGET_GROUPS  <- NULL  # Filter by Suite (e.g., "v6")
@@ -616,7 +622,8 @@ metadata    <- fromJSON(paste0(file_prefix, "metadata.json"))
 data_prefix <- "hypothesis_data/"
 timestamp   <- format(Sys.time(), "%Y-%m-%d_%H-%M-%S")
 RESULTS_ROOT <- "results"
-run_dir     <- file.path(RESULTS_ROOT, paste0("run_", timestamp))
+RUN_LABEL    <- if (!exists("LINEAR_METHOD") || LINEAR_METHOD == "contrast") "" else paste0("_", toupper(LINEAR_METHOD))
+run_dir     <- file.path(RESULTS_ROOT, paste0("run_", timestamp, RUN_LABEL))
 if (!dir.exists(run_dir)) dir.create(run_dir, recursive = TRUE)
 
 # --- FILTERING LOGIC ---
